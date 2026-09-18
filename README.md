@@ -1,8 +1,9 @@
 # Herbot
 
 Your **Hermes Bot Mode roster in the Omarchy bar**: every bot as its own avatar,
-the newest thing it said, and one click to it - plus typing to a bot straight
-from the panel.
+the newest thing it said, and one click to it.
+
+![Herbot in the bar and its panel](preview.png)
 
 A bot is a Hermes profile. There is no second source of truth here: the widget
 reads the same files the desktop writes (`profile.yaml`'s `ui_meta['hermes-bots']`
@@ -10,9 +11,14 @@ for the avatar, each profile's session store for the canonical **Bot Chat**), so
 a bot created, renamed or recoloured in Hermes Desktop shows up in the bar
 without any configuration on this side.
 
-Status: the headless core is built and verified against a live Hermes install
-(three bots, notification cards, a real message delivered into a Bot Chat). The
-QML bar widget is the remaining piece - see **Roadmap**.
+The bar entry, on its own:
+
+![The bot waiting on you beside the mark](assets/bar.png)
+
+Built and running on a live install: bar avatars in each bot's own shape and
+colour, the "waiting on you" count that survives a restart, notification cards on
+a bot write, and a click that opens (or switches to) that bot. The drawing engine
+is Rakabot's, adapted - see `NOTICE` for the lineage.
 
 ## What it does
 
@@ -21,9 +27,9 @@ QML bar widget is the remaining piece - see **Roadmap**.
 | Roster in the bar: avatar per bot, "waiting on you" count | yes |
 | Panel: sections, newest preview, relative time, activity | yes |
 | Desktop notification when a bot writes, click opens that bot | yes |
-| Send a message into a bot's canonical Bot Chat from the panel | yes |
+| Send a message into a bot's canonical Bot Chat | via `bin/hermbot-send` (the panel has no input, as in Rakabot) |
 | Open Hermes on the bot's most recent conversation | yes |
-| Open Hermes directly on the bot's **canonical Bot Chat** | not yet - upstream gap, see below |
+| Open Hermes directly on the bot's **canonical Bot Chat** | waiting on upstream: PR [#115195](https://github.com/NousResearch/hermes-agent/pull/115195) adds `hermes://bot/<profile>`, verified live from this widget's side - until it ships, a click opens the bot's most recently active visible session |
 
 ## Requirements
 
@@ -146,12 +152,12 @@ and `--chat` is already implemented and correct for the day the door exists.
 
 ## Roadmap
 
-1. `Widget.qml` - bar avatars (shape + colour from `ui_meta`), panel with
-  sections, preview, unread, an input that calls `hermbot-send`, click that
-  calls `hermbot-open`.
-2. `assets/hermbot.png` - our own card icon (until then the card uses the
-  `hermes` icon from the desktop's install).
-3. Manifest, CI, marketplace submission.
+1. Flip the click to the **canonical Bot Chat** the day `hermes://bot/<profile>`
+   ships in a released desktop (`HERMBOT_DESKTOP_BIN` already lets the door be
+   tested against a build from a branch).
+2. Unread as a count rather than a marker, once the store exposes one - Hermes
+   reports `unread` as a boolean today.
+3. Marketplace submission.
 
 ## Development
 

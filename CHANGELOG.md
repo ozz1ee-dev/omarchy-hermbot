@@ -27,10 +27,11 @@
   what was already unread - only when the *bot* wrote, one card per bot, and the
   first pass of a run records the world instead of describing it. Two watchers
   run (Omarchy instantiates a bar widget twice) and announce an event once.
-- Send a message into a bot's canonical **Bot Chat** from the panel, through the
-  same door Hermes itself uses for bot-to-bot DMs: the canonical chat is created
-  on demand by Hermes, never forked by this widget, and nothing is
-  shell-interpreted.
+- Send a message into a bot's canonical **Bot Chat** with `bin/hermbot-send`,
+  through the same door Hermes itself uses for bot-to-bot DMs: the canonical chat
+  is created on demand by Hermes, never forked by this widget, and nothing is
+  shell-interpreted. The panel deliberately has no input, exactly as Rakabot's
+  does not.
 - `bin/hermbot-watch` follows the install and streams the roster as JSON
   lines; `bin/hermbot-open` raises Hermes on a bot (packaged binary with the
   deep link as argv, then `xdg-open`, then raise the window); `bin/hermbot-send`

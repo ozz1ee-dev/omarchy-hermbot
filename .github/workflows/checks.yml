@@ -31,8 +31,12 @@ jobs:
           sudo apt-get install -y qt6-declarative-dev-tools
           echo "/usr/lib/qt6/bin" >> "$GITHUB_PATH"
       - name: qmllint
-        # The exit code is the check: qmllint prints warnings and unqualified
-        # access notes too, but only a real error fails the job.
+        # The exit code alone is NOT the check: this Qt reports a non-zero exit
+        # (255) for warnings too, and a Quickshell widget emits hundreds of them
+        # by design - the Omarchy modules are not on qmllint's import path, so
+        # every `Style.*` and unqualified access is expected noise. What matters
+        # is whether real errors were reported, so print everything and gate on
+        # an `Error:` line.
         run: |
           set -euo pipefail
           qmllint --version
@@ -45,7 +49,14 @@ jobs:
           fi
           echo "$files" | tr '\n' ' '
           echo
-          qmllint $files
+          rc=0
+          out=$(qmllint $files 2>&1) || rc=$?
+          printf '%s\n' "$out"
+          if printf '%s\n' "$out" | grep -q '^Error:'; then
+            echo "qmllint reported errors"
+            exit 1
+          fi
+          echo "qmllint rc=$rc, no errors (warnings are expected for a Quickshell widget)"
 
   ascii:
     runs-on: ubuntu-latest
