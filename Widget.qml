@@ -1058,11 +1058,18 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter
                 width: parent.width - Style.space(37) - Style.space(46)
                 text: {
+                  // Only the two session row kinds own a session. A bot, section or
+                  // rule row has none, and this binding runs for every row - an
+                  // invisible item still evaluates its bindings - so answering ""
+                  // here is what keeps the list from throwing on each rebuild.
                   if (modelData.kind === "attach") {
                     return root.label((modelData.mode === "live" ? "\u25b8 " : "\u21b3 ")
-                                      + String(modelData.session.title || ""))
+                                      + String((modelData.session || {}).title || ""))
                   }
-                  return root.label(String(modelData.session.title || ""))
+                  if (modelData.kind === "pinned") {
+                    return root.label(String((modelData.session || {}).title || ""))
+                  }
+                  return ""
                 }
                 color: modelData.kind === "attach" && modelData.mode === "live" ? root.accent : root.dim
                 font.family: root.fontFamily

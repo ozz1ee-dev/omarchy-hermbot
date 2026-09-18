@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.6
+
+- Fixed a `TypeError` thrown on every list rebuild: the session line's `text`
+  binding ran for every row, including the bot rows that carry no `session`
+  object, and read `.title` off `undefined`. QML evaluates a binding even when
+  the item is invisible, so the error arrived in bursts while the widget ran
+  (six per rebuild - three bots on two screens) and that row's text was lost
+  with it. The binding now answers only for the row kinds that own a session,
+  and reads it defensively, the way the timestamp line beside it already did.
+
 ## 0.3.5
 
 - The README now carries install and removal instructions (`omarchy plugin add`
