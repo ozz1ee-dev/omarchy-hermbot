@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.1
+
+- Fixed: switching the instance in the Hermes Desktop window left the bar on the
+  old one. The field the app moves on a switch is `lastUsed` in
+  `connections.json` - its own registry documents it as "the last source the
+  Sessions workspace successfully opened" - while `primary` only moves when you
+  make a connection primary. Measured by watching the file through a switch:
+  `primary` unchanged, `lastUsed` flipped to the host and back. The widget now
+  follows `lastUsed`, and only falls back to `primary` when it is absent.
+- A URL + token gateway connection cannot be read yet, so the bar keeps this
+  machine's roster - and now says so in the panel header (`HERMBOT - <name>
+  (remote) - local only`) instead of passing it off as the window's.
+
 ## 0.3.0
 
 - The bar follows Hermes Desktop: switch the app to another host and the roster

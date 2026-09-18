@@ -9,6 +9,16 @@ Your Hermes Bot Mode roster in the Omarchy bar. A bot is a Hermes profile, and
 this plugin reads the same files the desktop writes, so there is no second source
 of truth to keep in sync and no token to configure.
 
+**Which instance to follow is `lastUsed`, not `primary`.** Hermes Desktop
+records the source the Sessions workspace last opened in `connections.json`
+under `lastUsed` (its own comment: "the last source the Sessions workspace
+successfully opened"); `primary` only moves when a connection is made primary,
+and `launchMode: last-used` is about the *next* launch. Watching the file through
+a switch shows `lastUsed` flipping while `primary` stands still. Do not use the
+ssh tunnel as the signal either: the app's ControlMaster outlives a switch by
+`ControlPersist` (measured: the forwarded port was still listening after the
+window had gone back to this machine).
+
 **It only ever reads.** The roster, the avatars and the conversations come from
 the Hermes Desktop install the widget is following - this machine, or the SSH
 host the app is connected to (the watcher streams this same script there over one

@@ -524,9 +524,16 @@ def app_source(appdata=None):
         for row in registry.get("connections") or []:
             if isinstance(row, dict) and row.get("id"):
                 ids[str(row["id"])] = row
+        # lastUsed is documented in the app's own registry as "the last source
+        # the Sessions workspace successfully opened" - i.e. where the window is
+        # now, whatever launchMode says. Measured: switching the window from
+        # This device to an ssh host moved lastUsed and left primary alone, so
+        # reading primary (or only trusting lastUsed under launchMode
+        # 'last-used') left the bar on the wrong instance.
         primary = str(registry.get("primary") or "local")
-        if registry.get("launchMode") == "last-used" and registry.get("lastUsed"):
-            primary = str(registry["lastUsed"])
+        last_used = str(registry.get("lastUsed") or "")
+        if last_used and last_used in ids:
+            primary = last_used
     else:
         primary = "local"
     chosen = ids.get(primary)
@@ -549,7 +556,15 @@ def app_source(appdata=None):
         if not target["host"]:
             return "local", {}
         return "ssh", target
-    return "local", {}
+    # A gateway kind (URL + token) cannot be read yet - its stored token is
+    # rotated by every gateway restart and the roster shapes would have to be
+    # mapped. Say so instead of quietly showing this machine's bots as if they
+    # were the ones the window is looking at.
+    return "local", {
+        "unsupported": str(chosen.get("id") or "gateway"),
+        "unsupported_kind": str(chosen.get("kind") or "remote"),
+        "label": str(chosen.get("label") or chosen.get("host") or chosen.get("id") or "gateway"),
+    }
 
 
 def ssh_argv(target, remote_args):
@@ -990,6 +1005,10 @@ def stamp(snap, kind, target):
     label = "this device" if kind == "local" else (target.get("label") or target.get("host") or "remote")
     snap["source"] = "local" if kind == "local" else f"{kind}:{target.get('id') or target.get('host')}"
     snap["instance"] = label
+    if target.get("unsupported"):
+        # The window is somewhere we cannot read: be explicit rather than let the
+        # local roster pass for it.
+        snap["source_warning"] = f"{target['label']} ({target.get('unsupported_kind', 'remote')})"
     return snap
 
 
@@ -1023,8 +1042,9 @@ def source_of(args):
 def source_changed(args, kind, target):
     """Has the desktop switched connection since this run resolved one?
 
-    Switching in the app rewrites connections.json (that is what an apply does),
-    so the check is cheap: re-read it and compare. Without this the widget would
+    Switching in the app rewrites connections.json - measured: it moves lastUsed
+    and leaves primary alone - so re-reading that file is enough to notice. The
+    check is cheap: re-read it and compare. Without this the widget would
     keep showing the roster of the machine you were on when it started.
     """
     if (args.source or "auto").strip() != "auto":

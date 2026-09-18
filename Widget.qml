@@ -194,6 +194,9 @@ Panel {
   readonly property string instanceLabel: String(snap && snap.instance ? snap.instance : "")
   readonly property bool remoteSource: !!(snap && snap.source && String(snap.source).indexOf("local") !== 0)
   readonly property string sourceError: snap && snap.error ? String(snap.error) : ""
+  // The window sits somewhere this widget cannot read (a URL + token gateway):
+  // the roster is this machine's, so the header has to say that out loud.
+  readonly property string sourceWarning: snap && snap.source_warning ? String(snap.source_warning) : ""
   readonly property bool gatewayUp: !!gateway.running
   readonly property bool alarming: (counts.waiting || 0) > 0
   readonly property int unreadBots: {
@@ -927,6 +930,7 @@ Panel {
                   if (root.demoMode) return "HERMBOT · demo roster"
                   if (!root.snap) return "starting…"
                   if (root.sourceError) return "HERMBOT · " + (root.instanceLabel || "source") + " unreachable"
+                  if (root.sourceWarning) return "HERMBOT · " + root.sourceWarning + " · local only"
                   if (!root.gatewayUp) return "HERMBOT · gateway down"
                   if (root.remoteSource) return "HERMBOT · " + root.instanceLabel
                   var profiles = root.gateway.profiles
