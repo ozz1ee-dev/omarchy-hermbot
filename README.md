@@ -169,12 +169,18 @@ and `--chat` is already implemented and correct for the day the door exists.
 
 ## Roadmap
 
-1. Flip the click to the **canonical Bot Chat** the day `hermes://bot/<profile>`
+1. A **remote-gateway** connection (URL + token, no ssh) is not read yet: the
+   app's choice is visible in `connections.json`, but its stored token is rotated
+   on every gateway restart and the roster would have to be mapped from that
+   API's shapes. Until then the bar keeps reading this machine while the header
+   says so, rather than pretending to show the remote. An SSH connection - the
+   one this was built and measured against - is fully supported.
+2. Flip the click to the **canonical Bot Chat** the day `hermes://bot/<profile>`
    ships in a released desktop (`HERMBOT_DESKTOP_BIN` already lets the door be
    tested against a build from a branch).
-2. Unread as a count rather than a marker, once the store exposes one - Hermes
+3. Unread as a count rather than a marker, once the store exposes one - Hermes
    reports `unread` as a boolean today.
-3. Marketplace submission.
+4. Marketplace submission.
 
 ## Development
 
