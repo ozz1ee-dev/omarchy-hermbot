@@ -3,7 +3,7 @@ import QtQuick
 // Derived from Rakabot (https://github.com/ozz1ee-dev/omarchy-rakabot),
 // Copyright 2026 ozz1ee, Apache-2.0, which is derived from omabot
 // (https://github.com/njpatel/omabot), Copyright Neil Patel, Apache-2.0.
-// Changed for Herbot: the shape names are the ones Hermes stores in
+// Changed for Hermbot: the shape names are the ones Hermes stores in
 // `ui_meta['hermes-bots']` - a bare legacy shape, a blobatar string
 // (`blobatar`, `blobatar:<seed>`, `blobatar:<seed>:<kind>`, `blobatar::<kind>`)
 // or a sigil - and resolveSilhouette() below maps them onto Rakabot's own

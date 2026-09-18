@@ -703,7 +703,7 @@ def notify(event):
     if not sender:
         notify_log("no omarchy-notification-send on PATH - notifications disabled")
         return False
-    cmd = [sender, "--app-name", "Herbot", "-u", "normal",
+    cmd = [sender, "--app-name", "Hermbot", "-u", "normal",
            "-r", str(replace_id(event["name"]))]
     icon = icon_arg()
     if icon:

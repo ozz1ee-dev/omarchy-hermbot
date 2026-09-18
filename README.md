@@ -1,9 +1,9 @@
-# Herbot
+# Hermbot
 
 Your **Hermes Bot Mode roster in the Omarchy bar**: every bot as its own avatar,
 the newest thing it said, and one click to it.
 
-![Herbot in the bar and its panel](preview.png)
+![Hermbot in the bar and its panel](preview.png)
 
 A bot is a Hermes profile. There is no second source of truth here: the widget
 reads the same files the desktop writes (`profile.yaml`'s `ui_meta['hermes-bots']`

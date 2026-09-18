@@ -8,7 +8,7 @@ import qs.Ui
 // Derived from Rakabot (https://github.com/ozz1ee-dev/omarchy-rakabot),
 // Copyright 2026 ozz1ee, Apache-2.0, which is derived from omabot
 // (https://github.com/njpatel/omabot), Copyright Neil Patel, Apache-2.0.
-// Changed for Herbot: the roster is read from the local Hermes install
+// Changed for Hermbot: the roster is read from the local Hermes install
 // instead of Rakazo's RPC API, the palette/shape list are Hermes' ui_meta, the
 // actions open Hermes on a bot's conversation, the settings keys are the
 // plugin's, and section grouping is the gateway grouping the payload
@@ -16,7 +16,7 @@ import qs.Ui
 // row layout, the avatar drawing, the expressions and every animation are
 // Rakabot's unchanged.
 //
-// Herbot: your Hermes Bot Mode roster in the Omarchy bar. bin/hermbot-watch
+// Hermbot: your Hermes Bot Mode roster in the Omarchy bar. bin/hermbot-watch
 // reads the same files the desktop writes and streams them; this renders each bot
 // as its own avatar - the shape and colour it carries in ui_meta - with an
 // expression for its state: alert when it is waiting on you, curious when it has
@@ -495,7 +495,7 @@ Panel {
     return wantingCount > 0 ? String(wantingCount) : ""
   }
   readonly property string barTooltip: {
-    if (!snap) return "Herbot"
+    if (!snap) return "Hermbot"
     if (!gatewayUp) return "Hermes: gateway not running"
     var c = counts
     var text = (c.bots || 0) + " bots · " + (c.waiting || 0) + " waiting on you · "
@@ -558,7 +558,7 @@ Panel {
     // into that padding so the mark and what follows read as one thing.
     spacing: -root.barPull
 
-    // The Herbot mark, always. Drawn rather than loaded from the desktop's
+    // The Hermbot mark, always. Drawn rather than loaded from the desktop's
     // icon so it takes the bar's colours like every other widget instead of
     // dropping a dark tile into the theme, and outlined so it carries the same
     // weight as the line glyphs beside it. Dimmed when the gateway is down.

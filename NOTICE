@@ -1,4 +1,4 @@
-Herbot
+Hermbot
 Copyright 2026 ozz1ee
 
 This product includes software developed as part of Rakabot
@@ -10,7 +10,7 @@ licensed under the Apache License, Version 2.0.
 Widget.qml and Avatar.qml here are derived from Rakabot's files, which are in
 turn derived from omabot's. The visual design, the avatar rendering (shapes,
 colour handling, eyes, expressions, entrance and gesture flourishes) and the
-bar/panel layout come from that lineage; what is new for Herbot is the data
+bar/panel layout come from that lineage; what is new for Hermbot is the data
 layer, which reads a local Hermes install instead of a hosted chat service, and
 the actions, which open Hermes and deliver into a bot's canonical chat.
 
@@ -34,6 +34,6 @@ Trademarks
 The Apache License grants no trademark rights (section 6). "Rakabot", "omabot"
 and their authors' names appear here only to credit the original work, and
 "Hermes" appears only to describe what this plugin talks to. This plugin is
-called Herbot, is published under its own id (ozz1ee.hermbot), and is not
+called Hermbot, is published under its own id (ozz1ee.hermbot), and is not
 affiliated with, sponsored by or endorsed by the omabot author or by Nous
 Research.

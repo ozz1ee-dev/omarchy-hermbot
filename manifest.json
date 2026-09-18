@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "id": "ozz1ee.hermbot",
-  "name": "Herbot",
+  "name": "Hermbot",
   "version": "0.1.0",
   "author": "ozz1ee",
   "license": "Apache-2.0",
-  "description": "Your Hermes Bot Mode roster in the bar: every bot drawn as its own avatar, the newest thing it said, and one click - or one line of typing - to reach it.",
+  "description": "Your Hermes Bot Mode roster in the bar: every bot drawn as its own avatar, the newest thing it said, and one click to reach it.",
   "kinds": [
     "bar-widget"
   ],
@@ -13,7 +13,7 @@
     "barWidget": "Widget.qml"
   },
   "barWidget": {
-    "displayName": "Herbot",
+    "displayName": "Hermbot",
     "description": "Bots that are active or waiting on you appear in the bar as their own avatars - the shape and colour they have in Hermes - and the panel lists every bot with its newest message, an input that sends to the selected bot, and one click to open it.",
     "category": "AI",
     "aliases": [

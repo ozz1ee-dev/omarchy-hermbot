@@ -1,4 +1,4 @@
-# Working on Herbot
+# Working on Hermbot
 
 > Not called `AGENTS.md`, and not at the repository root, on purpose. Omarchy
 > installs a plugin's whole tree into `~/.config/omarchy/plugins/`, so a root
