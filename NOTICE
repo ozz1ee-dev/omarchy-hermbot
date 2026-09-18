@@ -5,7 +5,9 @@ This product includes software developed as part of Rakabot
 (https://github.com/ozz1ee-dev/omarchy-rakabot), Copyright 2026 ozz1ee, licensed
 under the Apache License, Version 2.0 - and, through Rakabot, software developed
 as part of omabot (https://github.com/njpatel/omabot), Copyright Neil Patel,
-licensed under the Apache License, Version 2.0.
+licensed under the Apache License, Version 2.0. The omabot author confirmed
+publicly that reuse under Apache-2.0 is welcome with the licence and notice
+requirements preserved (njpatel/omabot#5, 18 September 2026).
 
 Widget.qml and Avatar.qml here are derived from Rakabot's files, which are in
 turn derived from omabot's. The visual design, the avatar rendering (shapes,

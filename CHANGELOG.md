@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.4
+
+- NOTICE records the upstream author's public confirmation that reuse of omabot
+  under Apache-2.0 is welcome with the licence and notice requirements preserved
+  (njpatel/omabot#5). No code changed.
+
 ## 0.3.3
 
 Documentation and screenshots only; no behaviour changed.
