@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hermesbots-watch - follow the local Hermes install and stream its Bot Mode
+# hermbot-watch - follow the local Hermes install and stream its Bot Mode
 # roster as JSON lines.
 #
 #   stdout  {"generated_ts":..., "gateway":{...}, "counts":{...}, "bots":[...]}
@@ -7,7 +7,7 @@
 #           --interval N      seconds between polls (default 5)
 #           --pretty          human-readable JSON instead of one line
 #           --state PATH      state file for notification transitions (default
-#                             ~/.local/state/omarchy/hermesbots/notify.json)
+#                             ~/.local/state/omarchy/hermbot/notify.json)
 #           --notify          emit omarchy notifications on state transitions
 #           --hermes-root P   override ~/.hermes
 #
@@ -20,9 +20,13 @@
 # its Bots pane is what this emits: avatar metadata from profile.yaml's
 # ui_meta['hermes-bots'], plus the one canonical chat that identifies the
 # relationship - the session titled exactly "Bot Chat" (always born hidden).
-# "Waiting on you" is the desktop's own watermark: last_activity_at past
-# last_read_at. "Active now" mirrors the roster's activity filter (a write in
-# the last 90s).
+# "Waiting on you" is the desktop's own watermark (last_activity_at past
+# last_read_at) OR the widget's own record: the bot's newest turn is its own and
+# is newer than the last time that bot was opened from the bar (seen.json,
+# written by hermbot-open). The desktop never writes its watermark while you
+# simply read, so without the second rule the roster sits still forever - and
+# the avatars only animate on state changes. "Active now" mirrors the roster's
+# activity filter (a write in the last 90s).
 import argparse
 import fcntl
 import json
@@ -37,7 +41,8 @@ import zlib
 from pathlib import Path
 
 DEFAULT_ROOT = Path.home() / ".hermes"
-DEFAULT_STATE = Path.home() / ".local/state/omarchy/hermesbots/notify.json"
+DEFAULT_STATE = Path.home() / ".local/state/omarchy/hermbot/notify.json"
+DEFAULT_SEEN = Path.home() / ".local/state/omarchy/hermbot/seen.json"   # last opened, per bot
 BOT_CHAT_TITLE = "Bot Chat"      # canonical chat title (tui_gateway contract)
 ACTIVE_WINDOW_S = 90             # desktop roster: "wrote within the last 90s"
 PREVIEW_CHARS = 160
@@ -404,8 +409,15 @@ def latest_message(con, session_id):
     return ("", None, None)
 
 
-def snapshot(root):
+def snapshot(root, seen=None):
+    """One roster snapshot.
+
+    `seen` maps bot name -> when that bot's chat was last opened from the bar;
+    a bot whose own newest turn is newer than that stamp is waiting on you (see
+    the header comment).
+    """
     now = time.time()
+    seen = seen or {}
     gw = gateway_status(root)
     served = set(gw["profiles"])
     bots = []
@@ -416,6 +428,12 @@ def snapshot(root):
             chat = canonical_chat(con, name) if con else None
             newest_ts, newest_sid, _newest_title = newest_activity(con)
             recent = recent_visible_session(con)
+            # What the bot itself said last: only its own turn is something to
+            # come back to.
+            if con is not None and chat and chat.get("session_id"):
+                _preview, wrote_role, wrote_ts = latest_message(con, chat["session_id"])
+            else:
+                wrote_role, wrote_ts = None, None
         finally:
             if con is not None:
                 con.close()
@@ -426,6 +444,13 @@ def snapshot(root):
                 "last_activity_at": 0, "last_read_at": None, "unread": False,
                 "preview": "", "preview_role": None, "preview_ts": None, "from_bot": None,
             }
+        # "It wrote and you have not looked": its own newest turn, past the last
+        # time this bot was opened from the bar. No record at all counts as
+        # nothing new - a fresh install must not paint every bot as waiting.
+        wrote_at = float(wrote_ts or 0) if wrote_role == "assistant" else 0.0
+        seen_at = float(seen.get(name) or 0)
+        unseen = bool(wrote_at and wrote_at > seen_at) if seen_at else False
+
         # Roster ordering/activity: newest of (bot created, newest message in any
         # of its sessions) - the desktop's own sortRosterBots().
         created_ms = bot.get("created") or 0
@@ -434,7 +459,10 @@ def snapshot(root):
             {
                 "gateway_served": name in served,
                 "chat": chat,
-                "waiting": bool(chat["exists"] and chat["unread"]),
+                "waiting": bool(chat["exists"] and (chat["unread"] or unseen)),
+                # Machine-readable trail of that same rule.
+                "wrote_at": wrote_at,
+                "seen_at": seen_at,
                 "active": bool(newest_ts and (now - newest_ts) < ACTIVE_WINDOW_S),
                 "activity_at": activity,
                 "newest_session_id": newest_sid,
@@ -445,11 +473,15 @@ def snapshot(root):
                     # Deep link into the canonical Bot Chat. The desktop's route
                     # validation drops a HIDDEN session id, so this link only
                     # works once the app grows a door for bot chats - the ladder
-                    # in hermesbots-open knows that and prefers recent_session.
+                    # in hermbot-open knows that and prefers recent_session.
                     "deep_link": (
                         f"hermes://open/{chat['session_id']}?profile={name}"
                         if chat["session_id"] else None
                     ),
+                    # Name-addressed door to the same chat (desktop PR #115195):
+                    # the app resolves the registry at open time, so the link is
+                    # correct by construction and cannot dangle on a stale id.
+                    "bot_link": f"hermes://bot/{name}",
                     "recent_deep_link": (
                         f"hermes://open/{recent['session_id']}?profile={name}"
                         if recent else None
@@ -510,6 +542,68 @@ def save_state(path, snap):
     os.replace(tmp, path)
 
 
+# ── what you have already looked at ─────────────────────────────────────────
+#
+# The desktop writes no read watermark while you merely read, so "the bot wrote
+# and you have not come back" has to be ours: hermbot-open stamps a bot here
+# every time a click opens it, and the snapshot compares that stamp with the
+# bot's own newest turn. Kept beside the notification state, in the same shape.
+
+
+def load_seen(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    bots = data.get("bots")
+    return bots if isinstance(bots, dict) else {}
+
+
+def save_seen(path, seen):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"updated_ts": time.time(), "bots": seen}
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def mark_seen(path, name):
+    """Record that this bot was just opened. Read-modify-write under the same
+    lock the notifications use, so two concurrent clicks cannot lose a stamp."""
+    handle = acquire_state_lock(path)
+    try:
+        seen = load_seen(path)
+        seen[name] = time.time()
+        save_seen(path, seen)
+    finally:
+        release_state_lock(handle)
+    return seen.get(name)
+
+
+def seed_seen(path, snap):
+    """Give every bot we have no record for a baseline of "read up to now".
+
+    Without it a fresh install would paint every bot as waiting on you (its last
+    turn is newer than no stamp at all), and a bot nobody ever clicks would never
+    be able to become waiting later either. Seeded at the bot's own last turn, so
+    what it says *after* this counts as news.
+    """
+    handle = acquire_state_lock(path)
+    try:
+        seen = load_seen(path)
+        changed = False
+        for bot in snap.get("bots", []):
+            if bot["name"] not in seen:
+                seen[bot["name"]] = bot.get("wrote_at") or snap.get("generated_ts") or time.time()
+                changed = True
+        if changed:
+            save_seen(path, seen)
+        return seen
+    finally:
+        release_state_lock(handle)
+
+
 def transitions(prev, snap):
     """Bots that just wrote - one card per change, written by the bot.
 
@@ -555,7 +649,7 @@ def notification_sender():
 
 def opener_path():
     """The click target, as an absolute path (a bar process has no bin/ on PATH)."""
-    return os.environ.get("HERMESBOTS_OPEN") or str(Path(__file__).resolve().parent / "hermesbots-open")
+    return os.environ.get("HERMBOT_OPEN") or str(Path(__file__).resolve().parent / "hermbot-open")
 
 
 def icon_arg():
@@ -564,10 +658,10 @@ def icon_arg():
     A bar widget is often instantiated twice, so the asset is located relative to
     this script (bin/../assets) rather than from the plugin's cwd.
     """
-    asset = Path(__file__).resolve().parent.parent / "assets" / "hermesbots.png"
+    asset = Path(__file__).resolve().parent.parent / "assets" / "hermbot.png"
     if asset.is_file():
         return str(asset)
-    for candidate in ("hermesbots", "hermes"):
+    for candidate in ("hermbot", "hermes"):
         for root in ("/usr/share/icons", str(Path.home() / ".local/share/icons"), "/usr/share/omarchy"):
             try:
                 if Path(root).exists() and next(Path(root).rglob(candidate + ".*"), None):
@@ -609,7 +703,7 @@ def notify(event):
     if not sender:
         notify_log("no omarchy-notification-send on PATH - notifications disabled")
         return False
-    cmd = [sender, "--app-name", "Hermesbots", "-u", "normal",
+    cmd = [sender, "--app-name", "Herbot", "-u", "normal",
            "-r", str(replace_id(event["name"]))]
     icon = icon_arg()
     if icon:
@@ -684,13 +778,20 @@ def main(argv=None):
     ap.add_argument("--pretty", action="store_true", help="pretty-print each snapshot")
     ap.add_argument("--state", default=str(DEFAULT_STATE), help="notification state file")
     ap.add_argument("--notify", action="store_true", help="send omarchy notifications on transitions")
-    ap.add_argument("--hermes-root", default=os.environ.get("HERMESBOTS_ROOT", str(DEFAULT_ROOT)))
+    ap.add_argument("--seen", default=str(DEFAULT_SEEN), help="last-opened watermark per bot")
+    ap.add_argument("--mark-seen", metavar="BOT",
+                    help="record that this bot was just opened, then exit (used by hermbot-open)")
+    ap.add_argument("--hermes-root", default=os.environ.get("HERMBOT_ROOT", str(DEFAULT_ROOT)))
     args = ap.parse_args(argv)
+
+    if args.mark_seen:
+        mark_seen(args.seen, args.mark_seen.lstrip("@").strip())
+        return 0
 
     root = Path(args.hermes_root).expanduser()
     while True:
         try:
-            snap = snapshot(root)
+            snap = snapshot(root, load_seen(args.seen))
         except Exception as exc:  # never take the bar down with us
             err = {"generated_ts": time.time(), "error": f"{type(exc).__name__}: {exc}", "bots": [], "counts": {}}
             emit(err, args.pretty)
@@ -712,6 +813,10 @@ def main(argv=None):
             save_state(args.state, snap)
         finally:
             release_state_lock(handle)
+        if not args.once:
+            # Only the streaming watcher seeds: --once is a read-only query used
+            # by the opener, and it must not write state as a side effect.
+            seed_seen(args.seen, snap)
         emit(snap, args.pretty)
         if args.once:
             return 0

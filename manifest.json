@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "id": "ozz1ee.hermbot",
+  "name": "Herbot",
+  "version": "0.1.0",
+  "author": "ozz1ee",
+  "license": "Apache-2.0",
+  "description": "Your Hermes Bot Mode roster in the bar: every bot drawn as its own avatar, the newest thing it said, and one click - or one line of typing - to reach it.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Herbot",
+    "description": "Bots that are active or waiting on you appear in the bar as their own avatars - the shape and colour they have in Hermes - and the panel lists every bot with its newest message, an input that sends to the selected bot, and one click to open it.",
+    "category": "AI",
+    "aliases": [
+      "hermbot",
+      "bots",
+      "roster"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "barMetric": "avatars",
+      "maxBarAvatars": 3,
+      "notifyOnMessage": true,
+      "ordering": "attention"
+    },
+    "schema": [
+      {
+        "key": "barMetric",
+        "type": "enum",
+        "label": "What sits beside the mark",
+        "options": [
+          "avatars",
+          "count",
+          "none"
+        ],
+        "defaultValue": "avatars",
+        "description": "avatars = the bots that are active or waiting on you, drawn as themselves, with the waiting count beside them; count = just how many are waiting; none = the mark alone."
+      },
+      {
+        "key": "ordering",
+        "type": "enum",
+        "label": "Panel order",
+        "options": [
+          "attention",
+          "gateway",
+          "flat"
+        ],
+        "defaultValue": "attention",
+        "description": "attention = bots that want you first, longest wait at the top, then a rule and everyone else by recency; gateway = grouped by what the gateway serves and what it does not; flat = purely by recency. The g key cycles it and the choice is saved."
+      },
+      {
+        "key": "maxBarAvatars",
+        "type": "integer",
+        "label": "Most avatars to show in the bar",
+        "min": 1,
+        "max": 6,
+        "step": 1,
+        "defaultValue": 3
+      },
+      {
+        "key": "notifyOnMessage",
+        "type": "boolean",
+        "label": "Notify when a bot writes or waits for you",
+        "defaultValue": true,
+        "description": "Hermes' own desktop notifications are left to Hermes. This is the watcher raising an Omarchy card when a bot's newest message is not yours, with a click that opens that bot. Only transitions are announced, at most one card per bot."
+      }
+    ]
+  },
+  "preview": "preview.png"
+}

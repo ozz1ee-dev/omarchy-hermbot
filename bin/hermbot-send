@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# hermesbots-send - say something to a bot, from anywhere.
+# hermbot-send - say something to a bot, from anywhere.
 #
-#   hermesbots-send --bot dev "status?"           # fire, answer arrives later
-#   echo "long text" | hermesbots-send --bot web  # stdin is safe for any text
-#   hermesbots-send --bot dev --wait "ping"       # stay in the foreground
+#   hermbot-send --bot dev "status?"           # fire, answer arrives later
+#   echo "long text" | hermbot-send --bot web  # stdin is safe for any text
+#   hermbot-send --bot dev --wait "ping"       # stay in the foreground
 #
 # The delivery door is the one Hermes itself uses for bot-to-bot DMs
 # (tools/bot_mode_dm.py): a resume of the bot's canonical "Bot Chat", created
@@ -12,7 +12,7 @@
 # the desktop, the CLI and this widget then share one conversation per bot.
 #
 # Default is fire-and-forget: the turn runs detached, and the reply surfaces
-# through hermesbots-watch's notifications. --wait keeps it attached and prints
+# through hermbot-watch's notifications. --wait keeps it attached and prints
 # the reply, for scripts and debugging.
 import argparse
 import json
@@ -23,8 +23,8 @@ import tempfile
 import time
 from pathlib import Path
 
-WATCH = Path(__file__).resolve().parent / "hermesbots-watch"
-STATE = Path.home() / ".local/state/omarchy/hermesbots"
+WATCH = Path(__file__).resolve().parent / "hermbot-watch"
+STATE = Path.home() / ".local/state/omarchy/hermbot"
 SEND_LOG = STATE / "send.log"
 BOT_CHAT = "Bot Chat"
 
@@ -43,7 +43,7 @@ def resolve(name):
     out = subprocess.run([str(WATCH), "--once"], capture_output=True, text=True, timeout=30)
     if out.returncode != 0 or not out.stdout.strip():
         detail = out.stderr.strip() or out.stdout.strip()
-        raise RuntimeError(f"hermesbots-watch failed: {detail[:200]}")
+        raise RuntimeError(f"hermbot-watch failed: {detail[:200]}")
     snap = json.loads(out.stdout.splitlines()[-1])
     wanted = (name or "").lstrip("@").strip().lower()
     for bot in snap.get("bots", []):
@@ -139,7 +139,7 @@ def main(argv=None):
         print(json.dumps(result, ensure_ascii=False) if (args.json or args.dry_run) else result["command"])
         return 0
 
-    env = {**os.environ, "HERMESBOTS_SEND_FILE": str(query_file)}
+    env = {**os.environ, "HERMBOT_SEND_FILE": str(query_file)}
     if args.wait:
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(Path.home()))
         result["reply"] = (proc.stdout or "").strip()[-4000:]
@@ -149,7 +149,7 @@ def main(argv=None):
             log(f"{bot['name']}: wait failed rc={proc.returncode}")
     else:
         # Detached: the widget must return instantly, and the reply is announced
-        # by hermesbots-watch, not printed into a bar process that has exited.
+        # by hermbot-watch, not printed into a bar process that has exited.
         logf = STATE / "send.out"
         STATE.mkdir(parents=True, exist_ok=True)
         with logf.open("a", encoding="utf-8") as fh:
@@ -182,7 +182,7 @@ def _fail(args, message):
     if args.json or args.dry_run:
         print(json.dumps({"error": message}, ensure_ascii=False))
     else:
-        print(f"hermesbots-send: {message}", file=sys.stderr)
+        print(f"hermbot-send: {message}", file=sys.stderr)
     return 2
 
 

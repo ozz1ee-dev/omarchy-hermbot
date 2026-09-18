@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# hermesbots-open - open (or raise) Hermes on one bot's canonical chat.
+# hermbot-open - open (or raise) Hermes on one bot's canonical chat.
 #
-#   hermesbots-open --bot dev [--focus] [--print]
+#   hermbot-open --bot dev [--focus] [--print]
 #
 # How a click reaches the desktop: Hermes Desktop answers hermes:// deep links,
 # and `hermes://open/<session>?profile=<bot>` navigates straight to that chat
@@ -23,10 +23,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-WATCH = Path(__file__).resolve().parent / "hermesbots-watch"
+WATCH = Path(__file__).resolve().parent / "hermbot-watch"
 ELECTRON_BIN = Path.home() / ".hermes/hermes-agent/apps/desktop/release"
 SCHEME = "hermes://"
-LOG = Path.home() / ".local/state/omarchy/hermesbots/open.log"
+LOG = Path.home() / ".local/state/omarchy/hermbot/open.log"
 
 
 def log(line):
@@ -39,7 +39,18 @@ def log(line):
 
 
 def electron_binary():
-    """The packaged Hermes Electron binary, if this install has one."""
+    """The packaged Hermes Electron binary, if this install has one.
+
+    `HERMBOT_DESKTOP_BIN` overrides it with any executable that takes the deep
+    link as its first argument. That is how a build from a branch - or a dev
+    instance on its own `--user-data-dir` - can be driven from the bar before it
+    is released, without editing this file.
+    """
+    override = os.environ.get("HERMBOT_DESKTOP_BIN")
+    if override:
+        path = Path(override).expanduser()
+        if path.is_file() and os.access(path, os.X_OK):
+            return path
     root = ELECTRON_BIN
     if not root.exists():
         return None
@@ -86,6 +97,21 @@ def focus_window():
         return False
 
 
+def record_seen(name):
+    """Tell the watcher this bot's chat was just opened.
+
+    The desktop never writes a read watermark while you merely read, so this is
+    the only thing that ever clears "it wrote and you have not looked" - and
+    therefore the only thing that lets a waiting avatar settle.
+    """
+    try:
+        out = subprocess.run([str(WATCH), "--mark-seen", name],
+                             capture_output=True, text=True, timeout=15, check=False)
+        return out.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def snapshot(root=None):
     cmd = [str(WATCH), "--once"]
     if root:
@@ -93,7 +119,7 @@ def snapshot(root=None):
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if out.returncode != 0 or not out.stdout.strip():
         detail = out.stderr.strip() or out.stdout.strip()
-        raise RuntimeError(f"hermesbots-watch failed: {detail[:200]}")
+        raise RuntimeError(f"hermbot-watch failed: {detail[:200]}")
     return json.loads(out.stdout.splitlines()[-1])
 
 
@@ -126,12 +152,15 @@ def main(argv=None):
 
     open_info = bot.get("open") or {}
     recent = bot.get("recent_session") or {}
-    if args.chat and open_info.get("deep_link"):
-        # The canonical Bot Chat itself. The desktop drops this today: its route
-        # validation refuses a session id that is not in the loaded (visible)
-        # list, and bot chats are always hidden. Kept behind a flag so the widget
-        # is correct the day the app grows a door for bot chats.
-        target, what = open_info["deep_link"], "bot-chat"
+    if args.chat and open_info.get("bot_link"):
+        # The canonical Bot Chat, addressed by NAME (`hermes://bot/<profile>`,
+        # desktop PR #115195): the app resolves the same title registry a roster
+        # row click uses, so the hidden chat opens and the link cannot dangle.
+        # Desktops that predate that route drop it silently, which is why the
+        # widget only asks for it behind a flag until the door ships.
+        target, what = open_info["bot_link"], "bot-chat"
+    elif args.chat and open_info.get("deep_link"):
+        target, what = open_info["deep_link"], "bot-chat-session"
     elif open_info.get("recent_deep_link"):
         # What the roster's own right-click does: the bot's most recently active
         # ordinary conversation. Verified to switch the running desktop.
@@ -183,7 +212,12 @@ def main(argv=None):
             result["delivered"] = "no-door"
         if args.focus and desktop_running():
             result["focused"] = focus_window()
-    log(f"{result['bot']}: {result['target']} -> {result['delivered']}")
+    # An open that really reached the desktop counts as "you looked at it"; a
+    # dry run, a focus-only raise or a failed delivery does not.
+    if result["delivered"] not in (None, "dry-run", "focus-only", "no-door"):
+        result["seen_recorded"] = record_seen(bot["name"])
+    log(f"{result['bot']}: {result['target']} -> {result['delivered']}"
+        f"{' (seen)' if result.get('seen_recorded') else ''}")
 
     if args.json or args.dry_run:
         print(json.dumps(result, ensure_ascii=False))
@@ -196,7 +230,7 @@ def _fail(args, message):
     if args.json or args.dry_run:
         print(json.dumps({"error": message}, ensure_ascii=False))
     else:
-        print(f"hermesbots-open: {message}", file=sys.stderr)
+        print(f"hermbot-open: {message}", file=sys.stderr)
     return 2
 
 

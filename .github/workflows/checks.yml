@@ -1,0 +1,65 @@
+name: checks
+
+on:
+  push:
+  pull_request:
+
+# Least privilege: the checks below only read the repository.
+permissions:
+  contents: read
+
+jobs:
+  manifest:
+    runs-on: ubuntu-latest
+    steps:
+      # Third-party actions are pinned to a full commit SHA, never a mutable
+      # major tag: `@v5` can be repointed at different code and would then run
+      # in this repository's CI. The version comment is for humans, and the SHA
+      # is resolved from this repository's own dependency, not copied from a
+      # sibling repo: gh api repos/actions/checkout/git/ref/tags/v5 -q .object.sha
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: manifest contract
+        run: python3 scripts/check-manifest.py .
+
+  qml:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: install qmllint
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qt6-declarative-dev-tools
+          echo "/usr/lib/qt6/bin" >> "$GITHUB_PATH"
+      - name: qmllint
+        # The exit code is the check: qmllint prints warnings and unqualified
+        # access notes too, but only a real error fails the job.
+        run: |
+          set -euo pipefail
+          qmllint --version
+          files=$(git ls-files '*.qml')
+          if [ -z "$files" ]; then
+            # Temporary: the widget is still being written, so there is nothing
+            # to lint yet. The first tracked .qml file makes this branch dead.
+            echo "no tracked .qml files yet - nothing to lint"
+            exit 0
+          fi
+          echo "$files" | tr '\n' ' '
+          echo
+          qmllint $files
+
+  ascii:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: text files are ASCII
+        # QML is deliberately not in this list: a widget draws real glyphs as
+        # part of its design, and those belong in the file, not in a check that
+        # would force the author to spell them out as escapes.
+        run: |
+          set -euo pipefail
+          files=$(git ls-files '*.md' '*.py' '*.json' '*.yml' '*.sh')
+          if LC_ALL=C grep -nP '[^\x00-\x7F]' $files; then
+            echo "non-ASCII characters found in the lines above"
+            exit 1
+          fi
+          echo "all tracked text files are ASCII"

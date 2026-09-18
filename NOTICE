@@ -1,0 +1,39 @@
+Herbot
+Copyright 2026 ozz1ee
+
+This product includes software developed as part of Rakabot
+(https://github.com/ozz1ee-dev/omarchy-rakabot), Copyright 2026 ozz1ee, licensed
+under the Apache License, Version 2.0 - and, through Rakabot, software developed
+as part of omabot (https://github.com/njpatel/omabot), Copyright Neil Patel,
+licensed under the Apache License, Version 2.0.
+
+Widget.qml and Avatar.qml here are derived from Rakabot's files, which are in
+turn derived from omabot's. The visual design, the avatar rendering (shapes,
+colour handling, eyes, expressions, entrance and gesture flourishes) and the
+bar/panel layout come from that lineage; what is new for Herbot is the data
+layer, which reads a local Hermes install instead of a hosted chat service, and
+the actions, which open Hermes and deliver into a bot's canonical chat.
+
+Modified files
+--------------
+Widget.qml and Avatar.qml are changed versions of the files in Rakabot. Section
+4(b) of the licence asks for a prominent notice of modification, so each of
+those files carries a comment at the top naming the original, the licence and
+what changed. In short: the roster is read from the local Hermes profile
+metadata and session store instead of Rakazo's RPC API, the palette and shape
+list are Hermes' (`ui_meta['hermes-bots']`), the status wording is Hermes'
+("waiting on you" is the backend's own read watermark), and the actions open
+Hermes Desktop or send into a bot's canonical Bot Chat.
+
+New files, not derived from that lineage: bin/hermbot-watch,
+bin/hermbot-open, bin/hermbot-send, manifest.json, README.md,
+CHANGELOG.md, NOTICE, docs/, scripts/ and tests/.
+
+Trademarks
+----------
+The Apache License grants no trademark rights (section 6). "Rakabot", "omabot"
+and their authors' names appear here only to credit the original work, and
+"Hermes" appears only to describe what this plugin talks to. This plugin is
+called Herbot, is published under its own id (ozz1ee.hermbot), and is not
+affiliated with, sponsored by or endorsed by the omabot author or by Nous
+Research.
