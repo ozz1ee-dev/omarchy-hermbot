@@ -94,6 +94,31 @@ restart and a plugin update.
 - A Hermes install (`HERMES_HOME`, else `~/.hermes`), gateway or desktop backend running
 - `python3` (standard library only - no pip installs, no venv)
 
+## Install
+
+```bash
+omarchy plugin add https://github.com/ozz1ee-dev/omarchy-hermbot --enable
+omarchy bar put ozz1ee.hermbot --section center
+```
+
+Nothing is compiled and nothing is installed system-wide: the plugin is a folder
+of QML and Python that Omarchy clones into `~/.config/omarchy/plugins/`, and
+`omarchy plugin update ozz1ee.hermbot` is how it is updated later. The second
+line puts it on the bar; after that, its settings live in the bar's own settings
+UI.
+
+## Uninstall
+
+```bash
+omarchy plugin remove ozz1ee.hermbot --yes
+rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/hermbot"
+```
+
+The first line takes the widget off the bar and deletes the plugin folder. The
+second drops this plugin's own state - the notification record and the "you
+looked at it" watermark - which nothing else reads. Neither line touches a
+Hermes profile, and no Hermes install is modified.
+
 ## On someone else's machine
 
 Nothing here names a user, a home directory or an install path: the scripts find

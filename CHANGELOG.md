@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.5
+
+- The README now carries install and removal instructions (`omarchy plugin add`
+  / `omarchy plugin remove` plus the state directory to drop), which is a
+  marketplace checklist item. Documentation only.
+
 ## 0.3.4
 
 - NOTICE records the upstream author's public confirmation that reuse of omabot
