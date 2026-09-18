@@ -48,8 +48,8 @@ turn. If a change here would write into a profile, it is the wrong change.
 
 ## Layout
 
-| | | |
-| --- | --- | --- |
+| | |
+| --- | --- |
 | `bin/hermbot-watch` | follows the install and streams the roster as JSON lines |
 | `bin/hermbot-open` | raises Hermes on a bot, down a ladder of ways in |
 | `bin/hermbot-send` | says something to a bot, into its canonical Bot Chat |

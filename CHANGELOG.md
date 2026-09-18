@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.3
+
+Documentation and screenshots only; no behaviour changed.
+
+- The settings table claimed avatars mode draws a "waiting on you" count beside
+  the faces. It does not, by design: that number belongs to `barMetric: count`,
+  and in avatars mode the faces are the signal. The README, the manifest
+  description and the bar caption now say what the code does.
+- Documented what until now could only be found by reading the source: the panel
+  keys and all three mouse buttons, the IPC commands (`state`, `toggle`, `demo`,
+  `geometry`, `order`, `look`, ...), every setting with its default and real
+  effect, the full option list of all three binaries, and the five environment
+  variables they answer to.
+- Both screenshots retaken on an empty workspace with the neighbouring Rakazo
+  widget hidden, from the widget's own demo roster, now with the `s` key in the
+  footer.
+- The upstream section states the pull request's real state: open, drifted from
+  the app's main branch, and tested against a build of that branch rather than a
+  release.
+
 ## 0.3.2
 
 - The plugin no longer assumes this machine. `HERMES_HOME`, `XDG_STATE_HOME` and

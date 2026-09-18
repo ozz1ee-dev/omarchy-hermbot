@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ozz1ee.hermbot",
   "name": "Hermbot",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "author": "ozz1ee",
   "license": "Apache-2.0",
   "description": "Your Hermes Bot Mode roster in the bar: every bot drawn as its own avatar, the newest thing it said, and one click to reach it.",
@@ -42,7 +42,7 @@
           "none"
         ],
         "defaultValue": "avatars",
-        "description": "avatars = the bots that are active or waiting on you, drawn as themselves, with the waiting count beside them; count = just how many are waiting; none = the mark alone."
+        "description": "avatars = the bots that are active or waiting on you, drawn as themselves - no number, because the faces are the signal; count = one number: how many want you; none = the mark alone."
       },
       {
         "key": "ordering",
@@ -63,7 +63,8 @@
         "min": 1,
         "max": 6,
         "step": 1,
-        "defaultValue": 3
+        "defaultValue": 3,
+        "description": "How many faces sit beside the mark before the rest are left out; the panel always lists every bot."
       },
       {
         "key": "notifyOnMessage",

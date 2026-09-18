@@ -42,9 +42,7 @@ jobs:
           qmllint --version
           files=$(git ls-files '*.qml')
           if [ -z "$files" ]; then
-            # Temporary: the widget is still being written, so there is nothing
-            # to lint yet. The first tracked .qml file makes this branch dead.
-            echo "no tracked .qml files yet - nothing to lint"
+            echo "no tracked .qml files - nothing to lint"
             exit 0
           fi
           echo "$files" | tr '\n' ' '

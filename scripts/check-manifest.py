@@ -11,6 +11,7 @@ symlinks.
 
 import json
 import os
+import re
 import sys
 
 REQUIRED = ("schemaVersion", "id", "name", "version", "author", "description", "kinds", "entryPoints")
@@ -27,6 +28,88 @@ ENTRY_KEYS = {
 def fail(message):
     print("FAIL: %s" % message)
     return 1
+
+
+def read_text(path):
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        return handle.read()
+
+
+def check_settings(root, manifest, problems):
+    """The widget and the manifest must agree on the settings.
+
+    A setting the QML reads but the manifest does not declare cannot be set from
+    the bar's UI; one the manifest declares but nothing reads is a lie in the
+    settings list. Where both sides carry a literal default they must match too,
+    because the QML fallback is what a fresh install gets before anything is
+    saved.
+    """
+    entry = manifest.get("entryPoints") or {}
+    widget = str(entry.get("barWidget") or "")
+    schema = [s for s in (manifest.get("barWidget") or {}).get("schema") or [] if isinstance(s, dict)]
+    declared = {str(s["key"]): s for s in schema if s.get("key")}
+    if not widget or not declared:
+        return
+    path = os.path.join(root, widget)
+    if not os.path.isfile(path):
+        return
+    qml = read_text(path)
+
+    used = set()
+    fallbacks = {}
+    for match in re.finditer(r'setting\(\s*"([A-Za-z0-9_]+)"\s*(?:,\s*([^)]+?))?\)', qml):
+        key, literal = match.group(1), (match.group(2) or "").strip()
+        used.add(key)
+        if re.fullmatch(r'"[^"]*"|\'[^\']*\'|-?\d+(\.\d+)?|true|false', literal):
+            fallbacks[key] = literal.strip('"\'')
+
+    for key in sorted(used - set(declared)):
+        problems.append("the widget reads setting %r but the manifest does not declare it" % key)
+    for key in sorted(set(declared) - used):
+        problems.append("the manifest declares setting %r but the widget never reads it" % key)
+    for key, literal in sorted(fallbacks.items()):
+        expected = declared.get(key, {}).get("defaultValue")
+        if expected is None:
+            continue
+        # Lowercased: JSON true/false are Python True/False, and a naive compare
+        # would report every boolean setting as a mismatch.
+        if str(expected).strip().lower() != literal.strip().lower():
+            problems.append("setting %r: manifest default %r but the widget falls back to %r"
+                            % (key, str(expected), literal))
+
+
+def check_markdown_tables(root, problems):
+    """A row with the wrong number of cells silently breaks a table's layout.
+
+    Pipes inside inline code are escaped (\\|), so they are not counted - that is
+    the whole reason this check exists: an unescaped one turned a documented
+    variable into a broken table.
+    """
+    cell_pipe = re.compile(r"(?<!\\)\|")
+    for current, dirs, files in os.walk(root):
+        if ".git" in dirs:
+            dirs.remove(".git")
+        for name in sorted(files):
+            if not name.endswith(".md"):
+                continue
+            rel = os.path.relpath(os.path.join(current, name), root)
+            block = []
+
+            def flush():
+                nonlocal block
+                if len(block) >= 2:
+                    counts = {count for _, count in block}
+                    if len(counts) != 1:
+                        problems.append("%s line %d: this table has rows with %s cells"
+                                        % (rel, block[0][0], "/".join(str(c) for c in sorted(counts))))
+                block = []
+
+            for number, line in enumerate(read_text(os.path.join(current, name)).splitlines(), 1):
+                if line.lstrip().startswith("|"):
+                    block.append((number, len(cell_pipe.findall(line))))
+                else:
+                    flush()
+            flush()
 
 
 def main():
@@ -87,6 +170,9 @@ def main():
             if os.path.islink(os.path.join(current, name)):
                 problems.append("symlink in the plugin folder: %s"
                                 % os.path.relpath(os.path.join(current, name), root))
+
+    check_settings(root, manifest, problems)
+    check_markdown_tables(root, problems)
 
     if problems:
         for problem in problems:
