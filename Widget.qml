@@ -1109,7 +1109,11 @@ Panel {
                 anchors.leftMargin: Style.space(9)
                 anchors.bottom: parent.bottom
                 anchors.bottomMargin: Style.space(3)
-                text: root.label(String(modelData.bot.title || modelData.bot.name || "")).toUpperCase()
+                // Only a pinnedAgent row owns a `bot`. This binding runs for every
+                // row regardless of `visible`, so a section, rule or pinnedHeader
+                // row would otherwise read `.title` off undefined - the same hole
+                // the session line above had.
+                text: root.label(String((modelData.bot || {}).title || (modelData.bot || {}).name || "")).toUpperCase()
                 color: root.faint
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption

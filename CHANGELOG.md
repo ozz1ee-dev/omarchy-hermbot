@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.7
+
+- The same hole, one line further down: the pinned-agent header read `.title`
+  off a `bot` that section, rule and pinned-header rows do not have, so the
+  `TypeError` kept arriving from that binding after 0.3.6 fixed the session
+  line beside it. It now reads the bot defensively too. Both lines in the
+  delegate that touch a field only some row kinds own are guarded, and the
+  whole delegate was swept for the same shape (a bare `modelData.<field>.<sub>`
+  outside a ternary or `&&` chain is the only way to hit it).
+
 ## 0.3.6
 
 - Fixed a `TypeError` thrown on every list rebuild: the session line's `text`
