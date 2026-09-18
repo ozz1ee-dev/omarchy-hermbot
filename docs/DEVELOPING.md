@@ -10,8 +10,12 @@ this plugin reads the same files the desktop writes, so there is no second sourc
 of truth to keep in sync and no token to configure.
 
 **It only ever reads.** The roster, the avatars and the conversations come from
-the local install; nothing is written to a profile and nothing leaves the
-machine. What is written locally lives outside the plugin directory
+the Hermes Desktop install the widget is following - this machine, or the SSH
+host the app is connected to (the watcher streams this same script there over one
+ssh connection and re-emits its JSON lines; nothing is installed on the far side
+and its own state is untouched, because the copy there writes scratch files under
+`/tmp`). Nothing is written to a profile anywhere. What is written locally - this
+machine - lives outside the plugin directory
 (`~/.local/state/omarchy/hermbot/`) so an update cannot resurrect old events:
 the notification state (`notify.json`), the outbox for a detached send
 (`sends/`), and the "you looked at it" watermark (`seen.json`) that

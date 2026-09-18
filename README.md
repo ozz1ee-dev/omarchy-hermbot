@@ -28,6 +28,7 @@ is Rakabot's, adapted - see `NOTICE` for the lineage.
 | Panel: sections, newest preview, relative time, activity | yes |
 | Under each bot: the session it is in, else the last one it finished | yes, and clicking it opens that session |
 | Pinned chats, grouped by the bot they belong to | yes (`p` hides the section, the choice is saved) |
+| Follow Hermes Desktop to another host (SSH connection) | yes (`s` toggles auto/local; the header names the instance) |
 | Desktop notification when a bot writes, click opens that bot | yes |
 | Send a message into a bot's canonical Bot Chat | via `bin/hermbot-send` (the panel has no input, as in Rakabot) |
 | Open Hermes on the bot's most recent conversation | yes |
@@ -41,9 +42,14 @@ is Rakabot's, adapted - see `NOTICE` for the lineage.
 
 ## The three binaries
 
-All reads are read-only, from the local install; nothing is written to a profile
-and nothing is sent off the machine. There is no token to configure - unlike a
-hosted chat service, the Hermes roster is already on disk.
+All reads are read-only, from the instance Hermes Desktop is on; nothing is
+written to a profile and no credential is ever needed. There is no token to
+configure - unlike a hosted chat service, the Hermes roster is already on disk.
+When the desktop is pointed at an SSH host, that host's roster is read the same
+way: the watcher runs this same script there over one ssh connection it holds
+open, and the only thing written on the far side is a scratch file under `/tmp`
+that the copy there uses for its own state. Set `source` to `local` (or press
+`s`) to pin the bar to this machine regardless.
 
 ### `bin/hermbot-watch`
 

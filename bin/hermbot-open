@@ -112,8 +112,13 @@ def record_seen(name):
         return False
 
 
-def snapshot(root=None):
-    cmd = [str(WATCH), "--once"]
+def snapshot(root=None, source="auto"):
+    """One roster snapshot, from the same instance the widget is following.
+
+    The click has to resolve against that instance, not against this machine: a
+    session id from the wrong host is a link that opens nothing.
+    """
+    cmd = [str(WATCH), "--once", "--source", str(source)]
     if root:
         cmd += ["--hermes-root", str(root)]
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -124,9 +129,19 @@ def snapshot(root=None):
 
 
 def find_bot(snap, name):
+    """A bot by name, title or @handle.
+
+    A single-profile install names its bot `default` and calls it something else
+    ("Hermes - Ovhlab") with @hermes as the handle, so all three have to match -
+    otherwise a click on a remote row resolves to nothing.
+    """
     wanted = (name or "").lstrip("@").strip().lower()
     for bot in snap.get("bots", []):
-        if bot["name"].lower() == wanted or (bot.get("title") or "").lower() == wanted:
+        if bot["name"].lower() == wanted:
+            return bot
+        if (bot.get("title") or "").lower() == wanted:
+            return bot
+        if (bot.get("handle") or "").lstrip("@").lower() == wanted:
             return bot
     return None
 
@@ -142,10 +157,12 @@ def main(argv=None):
     ap.add_argument("--print", dest="dry_run", action="store_true", help="print the action instead of performing it")
     ap.add_argument("--json", action="store_true", help="machine-readable result")
     ap.add_argument("--hermes-root", default=None)
+    ap.add_argument("--source", default=os.environ.get("HERMBOT_SOURCE", "auto"),
+                    help="auto = follow Hermes Desktop's own connection; local; or ssh:<id|host>")
     args = ap.parse_args(argv)
 
     try:
-        snap = snapshot(args.hermes_root)
+        snap = snapshot(args.hermes_root, args.source)
     except (RuntimeError, json.JSONDecodeError) as exc:
         return _fail(args, str(exc))
     bot = find_bot(snap, args.bot)

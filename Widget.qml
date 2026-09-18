@@ -74,6 +74,11 @@ Panel {
   // to. On by default; `p` flips it and the choice is saved.
   property bool showPinned: String(setting("showPinned", "true")) !== "false"
 
+  // Which instance to follow: "auto" is Hermes Desktop's own connection, so the
+  // bar holds the roster of whatever the app is on - this machine, or the SSH
+  // host it is pointed at. "local" pins it to this machine.
+  property string source: String(setting("source", "auto"))
+
   function setting(name, fallback) {
     var s = root.settings || ({})
     return s[name] !== undefined && s[name] !== null ? s[name] : fallback
@@ -183,6 +188,12 @@ Panel {
   readonly property var counts: snap && snap.counts ? snap.counts : ({})
   readonly property var bots: snap && snap.bots ? snap.bots : []
   readonly property var gateway: snap && snap.gateway ? snap.gateway : ({})
+  // Which instance this roster came from, and whether it answered at all: the
+  // watcher follows Hermes Desktop's own connection, so the panel has to say
+  // whose bots it is showing.
+  readonly property string instanceLabel: String(snap && snap.instance ? snap.instance : "")
+  readonly property bool remoteSource: !!(snap && snap.source && String(snap.source).indexOf("local") !== 0)
+  readonly property string sourceError: snap && snap.error ? String(snap.error) : ""
   readonly property bool gatewayUp: !!gateway.running
   readonly property bool alarming: (counts.waiting || 0) > 0
   readonly property int unreadBots: {
@@ -318,8 +329,8 @@ Panel {
     // --notify is a bare flag here, not an argument: the watcher decides what a
     // transition is and owns the state file that keeps one card per bot.
     command: root.notifyOnMessage
-      ? [root.watcher, "--interval", "2", "--notify"]
-      : [root.watcher, "--interval", "2"]
+      ? [root.watcher, "--interval", "2", "--source", root.source, "--notify"]
+      : [root.watcher, "--interval", "2", "--source", root.source]
     running: true
     stdout: SplitParser { onRead: function(data) { root.parseState(data) } }
     stderr: SplitParser {
@@ -331,6 +342,7 @@ Panel {
   // A settings change has to land on the command line, and a running Process
   // will not pick up a new command: bounce it.
   onNotifyOnMessageChanged: { watcherProc.running = false; restartTimer.restart() }
+  onSourceChanged: { watcherProc.running = false; restartTimer.restart() }
 
   function parseState(text) {
     try {
@@ -431,6 +443,13 @@ Panel {
     showPinned = !showPinned
     Quickshell.execDetached(["omarchy", "bar", "set", "ozz1ee.hermbot", "showPinned",
                              showPinned ? "true" : "false"])
+    cursor = 0
+  }
+
+  // auto follows Hermes Desktop's connection; local pins the bar to this machine.
+  function cycleSource() {
+    source = source === "auto" ? "local" : "auto"
+    Quickshell.execDetached(["omarchy", "bar", "set", "ozz1ee.hermbot", "source", source])
     cursor = 0
   }
 
@@ -840,6 +859,7 @@ Panel {
         if (t === "r") root.cycleBarMetric()
         else if (t === "g" || t === "G") root.cycleOrdering()
         else if (t === "p" || t === "P") root.togglePinned()
+        else if (t === "s" || t === "S") root.cycleSource()
       }
 
       // Where the pointer is, in panel coordinates. Avatars map it into their
@@ -906,11 +926,13 @@ Panel {
                 text: {
                   if (root.demoMode) return "HERMBOT · demo roster"
                   if (!root.snap) return "starting…"
+                  if (root.sourceError) return "HERMBOT · " + (root.instanceLabel || "source") + " unreachable"
                   if (!root.gatewayUp) return "HERMBOT · gateway down"
+                  if (root.remoteSource) return "HERMBOT · " + root.instanceLabel
                   var profiles = root.gateway.profiles
                   return "HERMBOT · " + (profiles ? profiles.length : 0) + " profiles"
                 }
-                color: root.dim
+                color: root.sourceError ? root.urgent : root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
               }
@@ -1255,11 +1277,11 @@ Panel {
             // theme font size, so it steps down through three wordings and only
             // then elides. One fixed wording runs past the card edge.
             readonly property string hintFull: "j/k move · ⏎ open · g " + root.ordering
-                                               + " · p pinned · h hide · r beside mark: " + root.barMetric
+                                               + " · p pinned · s " + root.source + " · h hide · r beside mark: " + root.barMetric
             readonly property string hintMedium: "j/k · ⏎ open · g " + root.ordering
-                                                 + " · p pinned · h hide · r mark: " + root.barMetric
+                                                 + " · p pinned · s " + root.source + " · h hide · r mark: " + root.barMetric
             readonly property string hintShort: "j/k · ⏎ open · g " + root.ordering
-                                                + " · p · h hide · r " + root.barMetric
+                                                + " · p · s · h hide · r " + root.barMetric
             TextMetrics {
               id: hintFullMetrics
               font.family: root.fontFamily

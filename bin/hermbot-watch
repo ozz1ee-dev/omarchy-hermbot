@@ -47,6 +47,7 @@ BOT_CHAT_TITLE = "Bot Chat"      # canonical chat title (tui_gateway contract)
 ACTIVE_WINDOW_S = 90             # desktop roster: "wrote within the last 90s"
 PREVIEW_CHARS = 160
 HANDLE_DEFAULT = "hermes"        # @hermes is the default profile's alias
+APPDATA = Path.home() / ".config" / "Hermes"   # Hermes Desktop's own state
 
 
 # ── small helpers ───────────────────────────────────────────────────────────
@@ -479,6 +480,121 @@ def session_row(con, row):
     }
 
 
+# ── which instance: follow the desktop's own choice ─────────────────────────
+#
+# Hermes Desktop can hold several sources (this machine, an SSH host, a remote
+# gateway) and the roster has to be the roster of the one it is actually on. The
+# app publishes its choice on disk, so there is nothing to configure here:
+#
+#   connections.json (v2 registry)  primary / launchMode / lastUsed
+#   connection.json  (v1 routing)   mode / remote / profiles
+#
+# `primary` is what an apply writes back ("Apply must publish the same primary
+# identity to connections.json"), and `launchMode: last-used` means the app
+# reopens on `lastUsed` instead - so those two decide.
+#
+# An SSH source is read the way the app reads it: by running this very script on
+# the other machine over ssh and streaming its JSON lines back. Nothing needs to
+# be installed there, no token has to be minted, and the read stays read-only. A
+# remote-gateway source (URL + token) speaks HTTP instead, with the token the
+# app already stored for it.
+
+
+def app_registry(appdata=None):
+    """(registry, routing) as the desktop has them on disk, or (None, None)."""
+    base = Path(appdata) if appdata else APPDATA
+    def load(name):
+        try:
+            return json.loads((base / name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+    return load("connections.json"), load("connection.json")
+
+
+def app_source(appdata=None):
+    """The source Hermes Desktop is on: ("local", {}) or ("ssh", {...}).
+
+    SSH is the only remote kind this can read without a token: the tunnel the app
+    opens lives in its memory, but the host it points at is in the registry and
+    our own ssh gets there directly.
+    """
+    registry, routing = app_registry(appdata)
+    ids = {}
+    if isinstance(registry, dict):
+        for row in registry.get("connections") or []:
+            if isinstance(row, dict) and row.get("id"):
+                ids[str(row["id"])] = row
+        primary = str(registry.get("primary") or "local")
+        if registry.get("launchMode") == "last-used" and registry.get("lastUsed"):
+            primary = str(registry["lastUsed"])
+    else:
+        primary = "local"
+    chosen = ids.get(primary)
+    legacy = (routing or {}).get("mode")
+    if chosen is None and legacy and legacy != "local":
+        chosen = {"id": primary, "kind": legacy, **(routing.get("remote") or {})}
+    if not chosen or chosen.get("kind") in (None, "local"):
+        return "local", {}
+    if chosen.get("kind") == "ssh":
+        target = {
+            "id": chosen.get("id") or "ssh",
+            "label": chosen.get("label") or chosen.get("host") or "ssh",
+            "host": chosen.get("host"),
+            "user": chosen.get("user") or os.environ.get("USER") or "root",
+            "port": chosen.get("port"),
+            "key_path": chosen.get("keyPath"),
+            "remote_hermes_path": chosen.get("remoteHermesPath"),
+            "profile": chosen.get("remoteProfile"),
+        }
+        if not target["host"]:
+            return "local", {}
+        return "ssh", target
+    return "local", {}
+
+
+def ssh_argv(target, remote_args):
+    """The ssh call that runs this script on the other machine.
+
+    ControlMaster keeps one connection alive between polls, so the bar is not
+    paying for a handshake every two seconds.
+    """
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=8", "-o", "ControlMaster=auto",
+            "-o", f"ControlPersist=300", "-o", "LogLevel=ERROR"]
+    if target.get("port"):
+        argv += ["-p", str(target["port"])]
+    if target.get("key_path"):
+        argv += ["-i", str(target["key_path"])]
+    argv += [f"{target.get('user') or 'root'}@{target['host']}", "python3 -", *remote_args]
+    return argv
+
+
+def apply_local_waiting(snap, seen):
+    """Re-apply the widget's own "wrote and you have not looked" rule.
+
+    The remote side of a stream computes waiting from ITS state directory, which
+    is empty by construction - the record of what you have looked at belongs to
+    the machine you are sitting at, and it is the same record for every source.
+    """
+    if not isinstance(snap, dict) or not snap.get("bots"):
+        return snap
+    waiting = 0
+    for bot in snap["bots"]:
+        wrote = float(bot.get("wrote_at") or 0)
+        seen_at = float(seen.get(bot.get("name")) or 0)
+        unseen = bool(wrote and written_after(wrote, seen_at))
+        bot["waiting"] = bool((bot.get("chat") or {}).get("unread") or unseen)
+        if bot["waiting"]:
+            waiting += 1
+    if isinstance(snap.get("counts"), dict):
+        snap["counts"]["waiting"] = waiting
+    return snap
+
+
+def written_after(wrote, seen_at):
+    return bool(seen_at) and wrote > seen_at
+
+
 def snapshot(root, seen=None):
     """One roster snapshot.
 
@@ -851,6 +967,178 @@ def emit(snap, pretty):
         print(json.dumps(snap, ensure_ascii=False), flush=True)
 
 
+def settle(args, snap):
+    """Announce transitions and record the world, under the shared lock."""
+    handle = acquire_state_lock(args.state)
+    try:
+        if args.notify:
+            prev = load_state(args.state)
+            for event in transitions(prev, snap):
+                # A notification backend failure must never take the watcher
+                # (and with it the bar widget) down mid-poll.
+                try:
+                    notify(event)
+                except Exception as exc:  # noqa: BLE001 - log and carry on
+                    notify_log(f"{event.get('name')}: notify raised {type(exc).__name__}: {exc}")
+        save_state(args.state, snap)
+    finally:
+        release_state_lock(handle)
+
+
+def stamp(snap, kind, target):
+    """Name the instance this snapshot came from, for the panel's own header."""
+    label = "this device" if kind == "local" else (target.get("label") or target.get("host") or "remote")
+    snap["source"] = "local" if kind == "local" else f"{kind}:{target.get('id') or target.get('host')}"
+    snap["instance"] = label
+    return snap
+
+
+def source_of(args):
+    """(kind, target) for this run. An explicit --source wins over the app's own
+    choice, which is what a screenshot, a test or a fixed install wants."""
+    want = (args.source or "auto").strip()
+    if want == "auto":
+        return app_source(args.appdata)
+    if want == "local":
+        return "local", {}
+    if want.startswith("ssh:"):
+        pick = want[4:].strip()
+        registry, _ = app_registry(args.appdata)
+        rows = [r for r in ((registry or {}).get("connections") or []) if isinstance(r, dict)]
+        row = next((r for r in rows
+                    if pick in (str(r.get("id") or ""), str(r.get("host") or ""), str(r.get("label") or ""))), None)
+        row = row or {"id": pick, "host": pick}
+        host = row.get("host") or pick
+        return "ssh", {
+            "id": row.get("id") or pick,
+            "label": row.get("label") or host,
+            "host": host,
+            "user": row.get("user") or "root",
+            "port": row.get("port"),
+            "key_path": row.get("keyPath"),
+        }
+    return "local", {}
+
+
+def source_changed(args, kind, target):
+    """Has the desktop switched connection since this run resolved one?
+
+    Switching in the app rewrites connections.json (that is what an apply does),
+    so the check is cheap: re-read it and compare. Without this the widget would
+    keep showing the roster of the machine you were on when it started.
+    """
+    if (args.source or "auto").strip() != "auto":
+        return False
+    now_kind, now_target = app_source(args.appdata)
+    if now_kind != kind:
+        return True
+    if now_kind == "local":
+        return False
+    return (now_target.get("id"), now_target.get("host")) != (target.get("id"), target.get("host"))
+
+
+def ssh_stream(args, target):
+    """Stream the roster from another machine by running THIS script there.
+
+    One ssh connection is held open (ControlMaster) and the remote copy runs in
+    streaming mode; every line it prints is passed straight through, with the two
+    decisions that can only be made on this side re-made here: what you have
+    looked at, and whether a card should be raised. The remote copy keeps its
+    state in /tmp, so it never writes into that machine's own widget state.
+    """
+    # The root is only worth passing when it was named explicitly: the other
+    # machine's home is its own, and /home/<user>/.hermes does not exist there.
+    remote_args = ["--interval", str(args.interval)]
+    if str(args.hermes_root) != str(DEFAULT_ROOT):
+        remote_args += ["--hermes-root", str(args.hermes_root)]
+    remote_args += ["--state", "/tmp/hermbot-remote-notify.json",
+                    "--seen", "/tmp/hermbot-remote-seen.json"]
+    script = Path(__file__).read_text(encoding="utf-8")
+    while True:
+        try:
+            proc = subprocess.Popen(ssh_argv(target, remote_args), stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, bufsize=1)
+        except OSError as exc:
+            emit(stamp({"generated_ts": time.time(), "error": f"ssh failed: {exc}",
+                        "bots": [], "counts": {}}, "ssh", target), args.pretty)
+            if args.once:
+                return 1
+            time.sleep(max(args.interval, 2.0))
+            continue
+        try:
+            proc.stdin.write(script)
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        seen = load_seen(args.seen)
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                snap = json.loads(line)
+            except ValueError:
+                continue
+            snap = apply_local_waiting(stamp(snap, "ssh", target), seen)
+            settle(args, snap)
+            emit(snap, args.pretty)
+            if args.once:
+                proc.terminate()
+                return 0
+            if source_changed(args, "ssh", target):
+                notify_log(f"source ssh:{target.get('id')}: the desktop switched away")
+                proc.terminate()
+                return None
+        detail = ""
+        try:
+            detail = (proc.stderr.read() or "").strip()
+        except (OSError, ValueError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.SubprocessError:
+            proc.kill()
+        notify_log(f"source ssh:{target.get('id')}: stream ended ({detail[:160]!r})")
+        emit(stamp({"generated_ts": time.time(),
+                    "error": detail[:200] or "the other machine answered nothing",
+                    "bots": [], "counts": {}}, "ssh", target), args.pretty)
+        if args.once:
+            return 1
+        time.sleep(max(args.interval, 2.0))
+
+
+def local_stream(args, kind, target):
+    """Follow this machine's install, and stop when the desktop moves elsewhere."""
+    root = Path(args.hermes_root).expanduser()
+    while True:
+        try:
+            snap = stamp(snapshot(root, load_seen(args.seen)), kind, target)
+        except Exception as exc:  # never take the bar down with us
+            err = {"generated_ts": time.time(), "error": f"{type(exc).__name__}: {exc}",
+                   "bots": [], "counts": {}}
+            emit(stamp(err, kind, target), args.pretty)
+            if args.once:
+                return 1
+            time.sleep(max(args.interval, 1.0))
+            continue
+        settle(args, snap)
+        if not args.once:
+            # Only the streaming watcher seeds: --once is a read-only query used
+            # by the opener, and it must not write state as a side effect.
+            seed_seen(args.seen, snap)
+        emit(snap, args.pretty)
+        if args.once:
+            return 0
+        if source_changed(args, kind, target):
+            notify_log("source local: the desktop switched away")
+            return None
+        time.sleep(max(args.interval, 1.0))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Follow the local Hermes Bot Mode roster.")
     ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
@@ -862,45 +1150,25 @@ def main(argv=None):
     ap.add_argument("--mark-seen", metavar="BOT",
                     help="record that this bot was just opened, then exit (used by hermbot-open)")
     ap.add_argument("--hermes-root", default=os.environ.get("HERMBOT_ROOT", str(DEFAULT_ROOT)))
+    ap.add_argument("--source", default="auto",
+                    help="auto = follow Hermes Desktop's own connection; local; or ssh:<id|host>")
+    ap.add_argument("--appdata", default=None,
+                    help="Hermes Desktop's state directory (default ~/.config/Hermes)")
     args = ap.parse_args(argv)
 
     if args.mark_seen:
         mark_seen(args.seen, args.mark_seen.lstrip("@").strip())
         return 0
 
-    root = Path(args.hermes_root).expanduser()
     while True:
-        try:
-            snap = snapshot(root, load_seen(args.seen))
-        except Exception as exc:  # never take the bar down with us
-            err = {"generated_ts": time.time(), "error": f"{type(exc).__name__}: {exc}", "bots": [], "counts": {}}
-            emit(err, args.pretty)
-            if args.once:
-                return 1
-            time.sleep(max(args.interval, 1.0))
+        kind, target = source_of(args)
+        rc = ssh_stream(args, target) if kind == "ssh" else local_stream(args, kind, target)
+        if rc is None:
+            # The desktop switched connection: resolve again and follow it. A
+            # short pause keeps a flapping registry from spinning.
+            time.sleep(min(max(args.interval, 1.0), 3.0))
             continue
-        handle = acquire_state_lock(args.state)
-        try:
-            if args.notify:
-                prev = load_state(args.state)
-                for event in transitions(prev, snap):
-                    # A notification backend failure must never take the watcher
-                    # (and with it the bar widget) down mid-poll.
-                    try:
-                        notify(event)
-                    except Exception as exc:  # noqa: BLE001 - log and carry on
-                        notify_log(f"{event.get('name')}: notify raised {type(exc).__name__}: {exc}")
-            save_state(args.state, snap)
-        finally:
-            release_state_lock(handle)
-        if not args.once:
-            # Only the streaming watcher seeds: --once is a read-only query used
-            # by the opener, and it must not write state as a side effect.
-            seed_seen(args.seen, snap)
-        emit(snap, args.pretty)
-        if args.once:
-            return 0
-        time.sleep(max(args.interval, 1.0))
+        return rc
 
 
 if __name__ == "__main__":

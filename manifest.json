@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ozz1ee.hermbot",
   "name": "Hermbot",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "ozz1ee",
   "license": "Apache-2.0",
   "description": "Your Hermes Bot Mode roster in the bar: every bot drawn as its own avatar, the newest thing it said, and one click to reach it.",
@@ -28,7 +28,8 @@
       "maxBarAvatars": 3,
       "notifyOnMessage": true,
       "ordering": "attention",
-      "showPinned": true
+      "showPinned": true,
+      "source": "auto"
     },
     "schema": [
       {
@@ -77,6 +78,17 @@
         "label": "Show pinned chats",
         "defaultValue": true,
         "description": "A PINNED section under the bot list, grouped by the bot each chat belongs to - the same chats Hermes Desktop shows pinned, and each one a click away. The p key flips it and the choice is saved."
+      },
+      {
+        "key": "source",
+        "type": "enum",
+        "label": "Which instance to follow",
+        "options": [
+          "auto",
+          "local"
+        ],
+        "defaultValue": "auto",
+        "description": "auto = Hermes Desktop's own connection: switch the app to another host and the bar shows that host's bots, within a poll. local = always this machine, whatever the app is on. The s key flips it and the choice is saved."
       }
     ]
   },

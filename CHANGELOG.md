@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0
+
+- The bar follows Hermes Desktop: switch the app to another host and the roster
+  becomes that host's bots (within a poll), with the panel header naming the
+  instance. An SSH connection is read by streaming this same watcher script to
+  the other machine over one long-lived ssh connection, so nothing has to be
+  installed there and no token has to be minted; the copy there keeps its own
+  state in `/tmp`, and notifications, the "you looked at it" watermark and the
+  session links stay decided on this side. The `s` key (or the `source` setting)
+  pins the bar to this machine when you would rather not follow.
+- A click resolves against the followed instance, and a bot is found by profile
+  name, display title or `@handle` - a single-profile install calls itself
+  `default` while showing "Hermes - Ovhlab" and answering to `@hermes`.
+
 ## 0.2.0
 
 - Each bot now carries the session it is in - or, when it is in none, the last one
