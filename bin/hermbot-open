@@ -136,6 +136,8 @@ def main(argv=None):
     ap.add_argument("--bot", required=True, help="bot name (Hermes profile) or @handle")
     ap.add_argument("--chat", action="store_true",
                     help="target the canonical Bot Chat (the desktop drops this link today - see README)")
+    ap.add_argument("--session", default=None,
+                    help="open this exact session id (a session row in the panel) instead of the bot's most recent one")
     ap.add_argument("--focus", "--select", dest="focus", action="store_true", help="raise the Hermes window")
     ap.add_argument("--print", dest="dry_run", action="store_true", help="print the action instead of performing it")
     ap.add_argument("--json", action="store_true", help="machine-readable result")
@@ -152,7 +154,12 @@ def main(argv=None):
 
     open_info = bot.get("open") or {}
     recent = bot.get("recent_session") or {}
-    if args.chat and open_info.get("bot_link"):
+    if args.session:
+        # A session row from the panel - the bot's own chat, or one of its pinned
+        # chats. These are ordinary visible sessions, so the plain session link is
+        # the door, and the profile tells the app which bot it belongs to.
+        target, what = f"{SCHEME}open/{args.session}?profile={bot['name']}", "session"
+    elif args.chat and open_info.get("bot_link"):
         # The canonical Bot Chat, addressed by NAME (`hermes://bot/<profile>`,
         # desktop PR #115195): the app resolves the same title registry a roster
         # row click uses, so the hidden chat opens and the link cannot dangle.
@@ -212,9 +219,12 @@ def main(argv=None):
             result["delivered"] = "no-door"
         if args.focus and desktop_running():
             result["focused"] = focus_window()
-    # An open that really reached the desktop counts as "you looked at it"; a
-    # dry run, a focus-only raise or a failed delivery does not.
-    if result["delivered"] not in (None, "dry-run", "focus-only", "no-door"):
+    # An open that really reached the desktop counts as "you looked at it" - but
+    # only the doors that show what the bot itself said. A pinned chat of the same
+    # profile is a different conversation, so opening it must not clear the "it
+    # wrote and you have not looked" watermark.
+    if result["delivered"] not in (None, "dry-run", "focus-only", "no-door") \
+            and result["what"] != "session":
         result["seen_recorded"] = record_seen(bot["name"])
     log(f"{result['bot']}: {result['target']} -> {result['delivered']}"
         f"{' (seen)' if result.get('seen_recorded') else ''}")

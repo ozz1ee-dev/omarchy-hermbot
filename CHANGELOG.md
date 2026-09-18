@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0
+
+- Each bot now carries the session it is in - or, when it is in none, the last one
+  it finished - and a click on that row opens it. The section under the bot list is
+  Hermes Desktop's own Pinned, grouped by the bot each chat belongs to, with every
+  row openable through the same session deep link; `p` hides it and the choice is
+  saved.
+- Opening a session from those rows deliberately does **not** clear the bot's
+  "it wrote and you have not looked" watermark: a pinned chat is a different
+  conversation, and reading it is not reading what the bot said to you.
+
 ## 0.1.0
 
 - First release: your Hermes Bot Mode roster in the Omarchy bar. A bot is a

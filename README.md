@@ -26,6 +26,8 @@ is Rakabot's, adapted - see `NOTICE` for the lineage.
 |---|---|
 | Roster in the bar: avatar per bot, "waiting on you" count | yes |
 | Panel: sections, newest preview, relative time, activity | yes |
+| Under each bot: the session it is in, else the last one it finished | yes, and clicking it opens that session |
+| Pinned chats, grouped by the bot they belong to | yes (`p` hides the section, the choice is saved) |
 | Desktop notification when a bot writes, click opens that bot | yes |
 | Send a message into a bot's canonical Bot Chat | via `bin/hermbot-send` (the panel has no input, as in Rakabot) |
 | Open Hermes on the bot's most recent conversation | yes |
@@ -92,7 +94,16 @@ Definitions are taken from the desktop's own code, not invented:
   the avatars only animate on state changes. A bot with no record is seeded at
   its own last turn, so a fresh install announces nothing.
 - **active** = a message in any of the bot's sessions within 90 s (the roster's
- own activity window).
+  own activity window).
+- **the session under a bot** = the one it is still in (`ended_at` is NULL), and
+  when it is in none, the last one it finished - newest by activity either way,
+  because several sessions can be left open at once. Hidden sessions are skipped:
+  the row exists to be opened, and a canonical Bot Chat is not openable. The
+  marker says which of the two you are looking at, and the accent colour means
+  the bot is in it right now.
+- **pinned** = `pinned = 1` on a visible session, listed in its own section under
+  the bot it belongs to - the desktop's own Pinned, and never a second copy of a
+  row that is already in the list.
 - **row order** = newest of (bot created, newest message in any of its sessions).
 - **canonical chat** = the session titled exactly `Bot Chat` - always hidden, and
  the only door to a bot's forever-conversation.

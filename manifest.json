@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ozz1ee.hermbot",
   "name": "Hermbot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "ozz1ee",
   "license": "Apache-2.0",
   "description": "Your Hermes Bot Mode roster in the bar: every bot drawn as its own avatar, the newest thing it said, and one click to reach it.",
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Hermbot",
-    "description": "Bots that are active or waiting on you appear in the bar as their own avatars - the shape and colour they have in Hermes - and the panel lists every bot with its newest message, an input that sends to the selected bot, and one click to open it.",
+    "description": "Bots that are active or waiting on you appear in the bar as their own avatars - the shape and colour they have in Hermes - and the panel lists every bot with its newest message, the session it is in (or the last one it finished), its pinned chats, and one click to open any of them.",
     "category": "AI",
     "aliases": [
       "hermbot",
@@ -27,7 +27,8 @@
       "barMetric": "avatars",
       "maxBarAvatars": 3,
       "notifyOnMessage": true,
-      "ordering": "attention"
+      "ordering": "attention",
+      "showPinned": true
     },
     "schema": [
       {
@@ -69,6 +70,13 @@
         "label": "Notify when a bot writes or waits for you",
         "defaultValue": true,
         "description": "Hermes' own desktop notifications are left to Hermes. This is the watcher raising an Omarchy card when a bot's newest message is not yours, with a click that opens that bot. Only transitions are announced, at most one card per bot."
+      },
+      {
+        "key": "showPinned",
+        "type": "boolean",
+        "label": "Show pinned chats",
+        "defaultValue": true,
+        "description": "A PINNED section under the bot list, grouped by the bot each chat belongs to - the same chats Hermes Desktop shows pinned, and each one a click away. The p key flips it and the choice is saved."
       }
     ]
   },

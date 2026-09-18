@@ -409,6 +409,76 @@ def latest_message(con, session_id):
     return ("", None, None)
 
 
+def attach_session(con):
+    """The session to hang off a bot's row, and how it is labelled.
+
+    Rule (the owner's): the session still open for this bot, or - when there is
+    none - the last one that was finished. "Open" is `ended_at IS NULL`, the
+    desktop's own line between a chat that is still going and one that is closed,
+    and several can legitimately be open at once, so the newest by activity wins.
+    Hidden rows are skipped: the row exists to be opened, and a canonical Bot Chat
+    is not openable.
+
+    Returns (row, mode) with mode in {"live", "closed", None}.
+    """
+    if con is None:
+        return None, None
+    base = (
+        "SELECT id, title, last_activity_at, ended_at, message_count FROM sessions"
+        " WHERE archived = 0 AND hidden = 0"
+    )
+    for mode, clause in (("live", " AND ended_at IS NULL"), ("closed", " AND ended_at IS NOT NULL")):
+        try:
+            row = con.execute(base + clause + " ORDER BY last_activity_at DESC LIMIT 1").fetchone()
+        except sqlite3.Error:
+            row = None
+        if row:
+            return session_row(con, row), mode
+    return None, None
+
+
+def pinned_sessions(con, limit=12):
+    """This profile's pinned chats, newest first.
+
+    Exactly the desktop's own Pinned section: `pinned = 1`, still visible, and
+    deliberately excluded from the ordinary list so a chat never appears twice.
+    """
+    if con is None:
+        return []
+    try:
+        rows = con.execute(
+            "SELECT id, title, last_activity_at, ended_at, message_count FROM sessions"
+            " WHERE pinned = 1 AND archived = 0 AND hidden = 0"
+            " ORDER BY last_activity_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [session_row(con, row) for row in rows]
+
+
+def session_row(con, row):
+    """One session as the widget shows it.
+
+    A title is not always usable - the desktop writes the literal string "None"
+    for some chats - so fall back to the newest thing said there, exactly as the
+    desktop's own sessionTitle() falls back to a preview.
+    """
+    sid, title, activity, ended_at, count = row
+    label = "" if title is None else str(title).strip()
+    if not label or label == "None":
+        preview, _role, _ts = latest_message(con, sid) if con is not None else ("", None, None)
+        label = preview or "untitled"
+    return {
+        "session_id": sid,
+        "title": label,
+        "last_activity_at": float(activity or 0),
+        "ended": ended_at is not None,
+        "message_count": count or 0,
+        "deep_link": f"hermes://open/{sid}",
+    }
+
+
 def snapshot(root, seen=None):
     """One roster snapshot.
 
@@ -428,6 +498,10 @@ def snapshot(root, seen=None):
             chat = canonical_chat(con, name) if con else None
             newest_ts, newest_sid, _newest_title = newest_activity(con)
             recent = recent_visible_session(con)
+            # The row under the bot's own: the session it is in, else the last
+            # one it finished, plus that profile's pinned chats.
+            attach, attach_mode = attach_session(con)
+            pinned = pinned_sessions(con)
             # What the bot itself said last: only its own turn is something to
             # come back to.
             if con is not None and chat and chat.get("session_id"):
@@ -467,6 +541,11 @@ def snapshot(root, seen=None):
                 "activity_at": activity,
                 "newest_session_id": newest_sid,
                 "recent_session": recent,
+                # What the panel hangs off this bot: one session (live, else the
+                # last finished one) and every chat pinned in this profile.
+                "attach": attach,
+                "attach_mode": attach_mode,
+                "pinned": pinned,
                 "hermes_cmd": _hermes_cmd(name),
                 "open": {
                     "session_id": chat["session_id"],
@@ -501,6 +580,7 @@ def snapshot(root, seen=None):
             "waiting": sum(1 for b in bots if b["waiting"]),
             "active": sum(1 for b in bots if b["active"]),
             "no_chat": sum(1 for b in bots if not b["chat"]["exists"]),
+            "pinned": sum(len(b.get("pinned") or []) for b in bots),
         },
         "bots": bots,
     }

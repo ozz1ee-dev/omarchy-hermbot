@@ -70,6 +70,10 @@ Panel {
   // file that keeps one card per bot. Hermes' own cards are left to Hermes.
   property bool notifyOnMessage: String(setting("notifyOnMessage", "true")) !== "false"
 
+  // The pinned section: the desktop's own Pinned, grouped by the bot it belongs
+  // to. On by default; `p` flips it and the choice is saved.
+  property bool showPinned: String(setting("showPinned", "true")) !== "false"
+
   function setting(name, fallback) {
     var s = root.settings || ({})
     return s[name] !== undefined && s[name] !== null ? s[name] : fallback
@@ -115,32 +119,51 @@ Panel {
     // The shapes are the ones Hermes' own avatar picker ships - the legacy set
     // and the blobatar kinds - so the demo shows what a real roster can hold
     // rather than something ui_meta could never produce.
+    // Each staged bot also carries the session it is in (or the last one it
+    // finished) and a few pinned chats, both in English like the rest of the
+    // demo, so a screenshot shows the whole panel rather than two thirds of it.
+    var withThreads = function(b, attachTitle, attachMode, pinned) {
+      b.attach = { session_id: "demo_a_" + b.name, title: attachTitle,
+                   last_activity_at: b.chat.last_activity_at, ended: attachMode !== "live",
+                   message_count: 24, deep_link: "" }
+      b.attach_mode = attachMode
+      b.pinned = []
+      for (var i = 0; i < pinned.length; i++) {
+        b.pinned.push({ session_id: "demo_p_" + b.name + "_" + i, title: pinned[i][0],
+                        last_activity_at: ago(pinned[i][1]), ended: pinned[i][1] > 240,
+                        message_count: 30 + i, deep_link: "" })
+      }
+      return b
+    }
     var bots = [
-      bot("dev", "Dev - Local", "blobatar::round", "#dd4b66", 0, demoNeedsHelp, true, 34,
+      withThreads(bot("dev", "Dev - Local", "blobatar::round", "#dd4b66", 0, demoNeedsHelp, true, 34,
           "Both watchers ran at once and the lock held. The race is real, and it is closed."),
-      bot("default", "Hermes - Local", "squircle", "#8b5cf6", 2, false, false, 12,
+          "Lock test: two watchers, one lock", "live",
+          [["Plugin roadmap", 40], ["Bar widget design", 180], ["Release checklist", 1500]]),
+      withThreads(bot("default", "Hermes - Local", "squircle", "#8b5cf6", 2, false, false, 12,
           "Three bots on this machine. Want me to draft the release notes?", "@dev"),
-      bot("web", "Web - Local", "blobatar::sun", "#f59e0b", 1, false, false, 5,
+          "Release notes draft", "closed",
+          [["Homelab runbook", 300], ["Model choices", 2880]]),
+      withThreads(bot("web", "Web - Local", "blobatar::sun", "#f59e0b", 1, false, false, 5,
           "The gateway restarted cleanly and both sockets are back."),
-      bot("research", "Research - Local", "cloud", "#10b981", 0, false, true, 3,
+          "Digest sources", "live", [["Reading list", 600]]),
+      withThreads(bot("research", "Research - Local", "cloud", "#10b981", 0, false, true, 3,
           "Six papers shortlisted; two are the same result reported twice."),
-      bot("ops", "Ops - Local", "blobatar::cloud", "#06b6d4", 0, false, false, 88,
+          "Paper shortlist", "live", [["Methods review", 120]]),
+      withThreads(bot("ops", "Ops - Local", "blobatar::cloud", "#06b6d4", 0, false, false, 88,
           "Backups are four days behind and the NAS scrub finished clean."),
-      bot("notes", "Notes - Local", "hexagon", "#eab308", 0, false, false, 210,
+          "Backup audit", "closed", [["NAS scrub log", 1440]]),
+      withThreads(bot("notes", "Notes - Local", "hexagon", "#eab308", 0, false, false, 210,
           "Filed the meeting notes under the project they belong to."),
-      bot("finance", "Finance - Local", "capsule", "#3b82f6", 0, false, false, 400,
-          "Two receipts still missing from the Berlin trip."),
-      bot("home", "Home - Local", "pebble", "#ec4899", 0, false, false, 1500,
-          "Held two flights to Lisbon. Neither needs paying until Friday."),
-      bot("lab", "Lab - Local", "tablet", "#f97316", 0, false, false, 2600,
-          "The DNS rewrite is staged behind a flag; nothing is live yet."),
-      bot("reading", "Reading - Local", "teardrop", "#8d6e63", 0, false, false, 11000,
-          "Six saved articles this week. Two are the same paper.")
+          "Meeting notes: Q3 planning", "closed", [])
     ]
+    var pinnedTotal = 0
+    for (var p = 0; p < bots.length; p++) pinnedTotal += bots[p].pinned.length
     return {
       generated_ts: t, source: "demo",
       gateway: { pid: 0, running: true, state: "running", profiles: ["default", "dev", "web"] },
-      counts: { bots: bots.length, waiting: demoNeedsHelp ? 1 : 0, active: 2, no_chat: 0 },
+      counts: { bots: bots.length, waiting: demoNeedsHelp ? 1 : 0, active: 2, no_chat: 0,
+                pinned: pinnedTotal },
       bots: bots
     }
   }
@@ -211,8 +234,9 @@ Panel {
   }
   function colorFor(b) { return b.color ? b.color : dim }
 
-  // Rows the cursor can land on, rebuilt whenever the view changes.
-  readonly property var rows: {
+  // The bot list itself, before the rows that hang off it. Three orderings, all
+  // of them rebuilt whenever the view changes.
+  readonly property var rowsBase: {
     var out = []
     if (!snap) return out
     if (ordering === "attention") {
@@ -246,9 +270,45 @@ Panel {
     }
     return out
   }
+  // What the list actually is: each bot, then the one session that belongs under
+  // it (the chat it is in, or the last one it finished), and - at the end - the
+  // pinned chats again, grouped by the bot they belong to. Exactly the desktop's
+  // own arrangement, where a pinned chat is its own section and never a second
+  // copy of a row.
+  readonly property var rows: {
+    var base = rowsBase
+    var out = []
+    for (var i = 0; i < base.length; i++) {
+      out.push(base[i])
+      if (base[i].kind === "bot" && base[i].bot.attach) {
+        out.push({ kind: "attach", bot: base[i].bot, session: base[i].bot.attach,
+                   mode: base[i].bot.attach_mode })
+      }
+    }
+    if (!showPinned) return out
+    var groups = []
+    for (var j = 0; j < bots.length; j++) {
+      if (bots[j].pinned && bots[j].pinned.length > 0) groups.push(bots[j])
+    }
+    if (groups.length === 0) return out
+    out.push({ kind: "pinnedHeader" })
+    for (var g = 0; g < groups.length; g++) {
+      out.push({ kind: "pinnedAgent", bot: groups[g] })
+      for (var k = 0; k < groups[g].pinned.length; k++) {
+        out.push({ kind: "pinned", bot: groups[g], session: groups[g].pinned[k] })
+      }
+    }
+    return out
+  }
+
+  // Rows the cursor can land on: the bots and every session row under them. A
+  // heading is not a destination.
   readonly property var botRows: {
     var out = []
-    for (var i = 0; i < rows.length; i++) if (rows[i].kind === "bot") out.push(i)
+    for (var i = 0; i < rows.length; i++) {
+      var kind = rows[i].kind
+      if (kind === "bot" || kind === "attach" || kind === "pinned") out.push(i)
+    }
     return out
   }
 
@@ -357,6 +417,40 @@ Panel {
     root.close()
   }
 
+  // A session row - the one hanging off a bot, or one of its pinned chats. These
+  // are ordinary visible sessions, so the plain session deep link opens them; the
+  // name-addressed door is only needed for the hidden Bot Chat.
+  function openSession(bot, session) {
+    if (!bot || !session) return
+    Quickshell.execDetached([root.opener, "--bot", String(bot.name),
+                             "--session", String(session.session_id), "--focus"])
+    root.close()
+  }
+
+  function togglePinned() {
+    showPinned = !showPinned
+    Quickshell.execDetached(["omarchy", "bar", "set", "ozz1ee.hermbot", "showPinned",
+                             showPinned ? "true" : "false"])
+    cursor = 0
+  }
+
+  // Enter lands on whatever the cursor is on: a bot opens the bot, a session row
+  // opens that session.
+  function activateRow(index) {
+    if (index < 0 || index >= rows.length) return
+    var row = rows[index]
+    if (row.kind === "bot") root.openBot(row.bot)
+    else if (row.kind === "attach" || row.kind === "pinned") root.openSession(row.bot, row.session)
+  }
+
+  function clickRow(index) {
+    var row = rows[index]
+    if (!row) return
+    if (row.kind !== "bot" && row.kind !== "attach" && row.kind !== "pinned") return
+    root.cursor = index
+    root.activateRow(index)
+  }
+
   // The plain "open Hermes" path: the mark, a right-click, or a heading. The
   // opener has no bot-less form, so it lands on whoever wants you most.
   function focusTop() { if (bots.length > 0) root.openBot(bots[0]) }
@@ -409,6 +503,8 @@ Panel {
       return JSON.stringify({ x: panel.cardOrigin.x, y: panel.cardOrigin.y, w: panel.contentWidth, h: panel.contentHeight })
     }
     function metric(): string { root.cycleBarMetric(false); return root.barMetric }
+    // Stage the pinned section for a screenshot, or check it without a keyboard.
+    function pinned(): string { root.togglePinned(); return root.showPinned ? "pinned shown" : "pinned hidden" }
     // Aim the eyes at a point in the panel, in its own coordinates. The eyes
     // follow a real pointer; this is how a recording without one drives them.
     function look(x: int, y: int): string {
@@ -737,12 +833,13 @@ Panel {
         if (dx < 0) root.scrub = !root.scrub
         if (dy !== 0) root.moveCursor(dy)
       }
-      onActivateRequested: root.openBot(root.cursorBot)
+      onActivateRequested: root.activateRow(root.cursor)
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "r") root.cycleBarMetric()
         else if (t === "g" || t === "G") root.cycleOrdering()
+        else if (t === "p" || t === "P") root.togglePinned()
       }
 
       // Where the pointer is, in panel coordinates. Avatars map it into their
@@ -848,7 +945,9 @@ Panel {
               required property var modelData
               required property int index
               width: column.width
-              height: modelData.kind === "section" ? Style.space(26)
+              height: modelData.kind === "section" || modelData.kind === "pinnedHeader" ? Style.space(26)
+                    : modelData.kind === "pinnedAgent" ? Style.space(20)
+                    : modelData.kind === "attach" || modelData.kind === "pinned" ? Style.space(26)
                     : modelData.kind === "rule" ? Style.space(13) : Style.space(46)
 
               // The break between "wants you" and everyone else. At the same
@@ -889,6 +988,96 @@ Panel {
                 anchors.bottomMargin: Style.space(4)
                 text: root.label(modelData.name).toUpperCase() + "  " + (modelData.count || "")
                 color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              // The session rows: the one hanging off a bot, and its pinned chats.
+              // Both are ordinary visible sessions, so both take the cursor and a
+              // click - they open that session, not the bot.
+              Rectangle {
+                visible: modelData.kind === "attach" || modelData.kind === "pinned"
+                anchors.fill: parent
+                anchors.leftMargin: -Style.space(4)
+                anchors.rightMargin: -Style.space(4)
+                radius: Style.space(1.5)
+                color: index === root.cursor ? root.hilite : "transparent"
+
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onEntered: {
+                    root.cursor = index
+                    var e = mapToItem(keyCatcher, mouseX, mouseY)
+                    keyCatcher.pointerAt(e.x, e.y)
+                  }
+                  onExited: keyCatcher.pointerGone()
+                  onClicked: root.clickRow(index)
+                  onPositionChanged: function(mouse) {
+                    var p = mapToItem(keyCatcher, mouse.x, mouse.y)
+                    keyCatcher.pointerAt(p.x, p.y)
+                  }
+                }
+              }
+
+              // Under the bot's own text column, so the session reads as belonging
+              // to the row above it. A live session takes the accent colour and a
+              // marker; a finished one stays quiet.
+              Text {
+                textFormat: Text.PlainText
+                visible: modelData.kind === "attach" || modelData.kind === "pinned"
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(37)
+                anchors.verticalCenter: parent.verticalCenter
+                width: parent.width - Style.space(37) - Style.space(46)
+                text: {
+                  if (modelData.kind === "attach") {
+                    return root.label((modelData.mode === "live" ? "\u25b8 " : "\u21b3 ")
+                                      + String(modelData.session.title || ""))
+                  }
+                  return root.label(String(modelData.session.title || ""))
+                }
+                color: modelData.kind === "attach" && modelData.mode === "live" ? root.accent : root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+                maximumLineCount: 1
+              }
+              Text {
+                textFormat: Text.PlainText
+                visible: modelData.kind === "attach" || modelData.kind === "pinned"
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.fmtAgo(modelData.session ? modelData.session.last_activity_at : 0)
+                color: root.faint
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              // The pinned section, and the bot each group of pinned chats belongs
+              // to - the desktop's own Pinned, split by who owns the chat.
+              Text {
+                textFormat: Text.PlainText
+                visible: modelData.kind === "pinnedHeader"
+                anchors.left: parent.left
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: Style.space(4)
+                text: "PINNED"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+              Text {
+                textFormat: Text.PlainText
+                visible: modelData.kind === "pinnedAgent"
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(9)
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: Style.space(3)
+                text: root.label(String(modelData.bot.title || modelData.bot.name || "")).toUpperCase()
+                color: root.faint
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
               }
@@ -1029,7 +1218,7 @@ Panel {
                     keyCatcher.pointerAt(e.x, e.y)
                   }
                   onExited: keyCatcher.pointerGone()
-                  onClicked: root.openBot(modelData.kind === "bot" ? modelData.bot : null)
+                  onClicked: root.clickRow(index)
                   // Hover goes to the topmost item, so a row would otherwise
                   // starve the panel-wide tracker and the eyes would freeze
                   // exactly when you are looking at them.
@@ -1065,12 +1254,12 @@ Panel {
             // The hint has to fit the narrowest card the panel can be, in every
             // theme font size, so it steps down through three wordings and only
             // then elides. One fixed wording runs past the card edge.
-            readonly property string hintFull: "j/k move · ⏎ last chat · g " + root.ordering
-                                               + " · h hide · r beside mark: " + root.barMetric
-            readonly property string hintMedium: "j/k · ⏎ chat · g " + root.ordering
-                                                 + " · h hide · r mark: " + root.barMetric
-            readonly property string hintShort: "j/k · ⏎ chat · g " + root.ordering
-                                                + " · h hide · r " + root.barMetric
+            readonly property string hintFull: "j/k move · ⏎ open · g " + root.ordering
+                                               + " · p pinned · h hide · r beside mark: " + root.barMetric
+            readonly property string hintMedium: "j/k · ⏎ open · g " + root.ordering
+                                                 + " · p pinned · h hide · r mark: " + root.barMetric
+            readonly property string hintShort: "j/k · ⏎ open · g " + root.ordering
+                                                + " · p · h hide · r " + root.barMetric
             TextMetrics {
               id: hintFullMetrics
               font.family: root.fontFamily
