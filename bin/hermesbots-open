@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+# hermesbots-open - open (or raise) Hermes on one bot's canonical chat.
+#
+#   hermesbots-open --bot dev [--focus] [--print]
+#
+# How a click reaches the desktop: Hermes Desktop answers hermes:// deep links,
+# and `hermes://open/<session>?profile=<bot>` navigates straight to that chat
+# (same vocabulary its own notification clicks use). Two ladders, tried in
+# order, because a dev machine usually has several Hermes desktop entries
+# fighting over the scheme:
+#
+#   1. launch the packaged Electron binary WITH the link as argv - the running
+#      app takes it through its single-instance handler, a cold app boots on it;
+#   2. xdg-open the link, letting whatever owns xdg-scheme-handler/hermes take it.
+#
+# Nothing is written to any profile and no window is raised unless --focus is
+# given (a background event must never steal focus; a user click may).
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+WATCH = Path(__file__).resolve().parent / "hermesbots-watch"
+ELECTRON_BIN = Path.home() / ".hermes/hermes-agent/apps/desktop/release"
+SCHEME = "hermes://"
+LOG = Path.home() / ".local/state/omarchy/hermesbots/open.log"
+
+
+def log(line):
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a", encoding="utf-8") as fh:
+            fh.write(line.rstrip() + "\n")
+    except OSError:
+        pass
+
+
+def electron_binary():
+    """The packaged Hermes Electron binary, if this install has one."""
+    root = ELECTRON_BIN
+    if not root.exists():
+        return None
+    for cand in sorted(root.glob("*/Hermes")) + sorted(root.glob("Hermes")):
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def desktop_running():
+    """True when a Hermes Desktop window is alive (class 'Hermes')."""
+    hyprctl = shutil.which("hyprctl")
+    if not hyprctl:
+        return False
+    try:
+        out = subprocess.run([hyprctl, "-j", "clients"], capture_output=True, text=True, timeout=5)
+        if out.returncode != 0:
+            return False
+        for client in json.loads(out.stdout or "[]"):
+            if (client.get("class") or "").lower() == "hermes":
+                return True
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return False
+
+
+def focus_window():
+    """Raise the Hermes window.
+
+    This Hyprland is Lua-configured (Omarchy Quattro), so the old
+    `dispatch focuswindow class:...` string is rewritten into invalid Lua -
+    the dispatcher has to be called as Lua.
+    """
+    hyprctl = shutil.which("hyprctl")
+    if not hyprctl:
+        return False
+    try:
+        out = subprocess.run(
+            [hyprctl, "dispatch", 'hl.dsp.focus({ window = "class:^(Hermes)$" })'],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        return out.stdout.strip().startswith("ok")
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def snapshot(root=None):
+    cmd = [str(WATCH), "--once"]
+    if root:
+        cmd += ["--hermes-root", str(root)]
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if out.returncode != 0 or not out.stdout.strip():
+        detail = out.stderr.strip() or out.stdout.strip()
+        raise RuntimeError(f"hermesbots-watch failed: {detail[:200]}")
+    return json.loads(out.stdout.splitlines()[-1])
+
+
+def find_bot(snap, name):
+    wanted = (name or "").lstrip("@").strip().lower()
+    for bot in snap.get("bots", []):
+        if bot["name"].lower() == wanted or (bot.get("title") or "").lower() == wanted:
+            return bot
+    return None
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Open Hermes on one bot's canonical chat.")
+    ap.add_argument("--bot", required=True, help="bot name (Hermes profile) or @handle")
+    ap.add_argument("--chat", action="store_true",
+                    help="target the canonical Bot Chat (the desktop drops this link today - see README)")
+    ap.add_argument("--focus", "--select", dest="focus", action="store_true", help="raise the Hermes window")
+    ap.add_argument("--print", dest="dry_run", action="store_true", help="print the action instead of performing it")
+    ap.add_argument("--json", action="store_true", help="machine-readable result")
+    ap.add_argument("--hermes-root", default=None)
+    args = ap.parse_args(argv)
+
+    try:
+        snap = snapshot(args.hermes_root)
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        return _fail(args, str(exc))
+    bot = find_bot(snap, args.bot)
+    if bot is None:
+        return _fail(args, f"no bot named {args.bot!r} in the roster")
+
+    open_info = bot.get("open") or {}
+    recent = bot.get("recent_session") or {}
+    if args.chat and open_info.get("deep_link"):
+        # The canonical Bot Chat itself. The desktop drops this today: its route
+        # validation refuses a session id that is not in the loaded (visible)
+        # list, and bot chats are always hidden. Kept behind a flag so the widget
+        # is correct the day the app grows a door for bot chats.
+        target, what = open_info["deep_link"], "bot-chat"
+    elif open_info.get("recent_deep_link"):
+        # What the roster's own right-click does: the bot's most recently active
+        # ordinary conversation. Verified to switch the running desktop.
+        target, what = open_info["recent_deep_link"], "recent-session"
+    else:
+        # Nothing openable: raise the window and let the app decide.
+        target, what = None, "focus-only"
+
+    result = {
+        "bot": bot["name"],
+        "session_id": (recent or {}).get("session_id") or bot["chat"]["session_id"],
+        "target": target,
+        "what": what,
+        "delivered": None,
+        "focused": False,
+    }
+
+    if args.dry_run:
+        result["delivered"] = "dry-run"
+    elif target is None:
+        result["delivered"] = "focus-only"
+    else:
+        binary = electron_binary()
+        if binary:
+            try:
+                subprocess.Popen(
+                    [str(binary), target],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                result["delivered"] = "electron-argv"
+            except OSError as exc:
+                result["delivered"] = f"electron-failed: {exc}"
+        if result["delivered"] is None:
+            opener = shutil.which("xdg-open")
+            if opener:
+                try:
+                    subprocess.Popen(
+                        [opener, target],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    result["delivered"] = "xdg-open"
+                except OSError as exc:
+                    result["delivered"] = f"xdg-open-failed: {exc}"
+        if result["delivered"] is None:
+            result["delivered"] = "no-door"
+        if args.focus and desktop_running():
+            result["focused"] = focus_window()
+    log(f"{result['bot']}: {result['target']} -> {result['delivered']}")
+
+    if args.json or args.dry_run:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        print(f"{result['bot']}: {result['target']} ({result['delivered']})")
+    return 0 if result["delivered"] not in (None, "no-door") else 1
+
+
+def _fail(args, message):
+    if args.json or args.dry_run:
+        print(json.dumps({"error": message}, ensure_ascii=False))
+    else:
+        print(f"hermesbots-open: {message}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

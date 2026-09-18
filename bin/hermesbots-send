@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+# hermesbots-send - say something to a bot, from anywhere.
+#
+#   hermesbots-send --bot dev "status?"           # fire, answer arrives later
+#   echo "long text" | hermesbots-send --bot web  # stdin is safe for any text
+#   hermesbots-send --bot dev --wait "ping"       # stay in the foreground
+#
+# The delivery door is the one Hermes itself uses for bot-to-bot DMs
+# (tools/bot_mode_dm.py): a resume of the bot's canonical "Bot Chat", created
+# on demand, with the message handed over through --query-file so nothing is
+# shell-interpreted. Delivering into that same forever-chat is the whole point -
+# the desktop, the CLI and this widget then share one conversation per bot.
+#
+# Default is fire-and-forget: the turn runs detached, and the reply surfaces
+# through hermesbots-watch's notifications. --wait keeps it attached and prints
+# the reply, for scripts and debugging.
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+WATCH = Path(__file__).resolve().parent / "hermesbots-watch"
+STATE = Path.home() / ".local/state/omarchy/hermesbots"
+SEND_LOG = STATE / "send.log"
+BOT_CHAT = "Bot Chat"
+
+
+def log(line):
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        with SEND_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line.rstrip()}\n")
+    except OSError:
+        pass
+
+
+def resolve(name):
+    """The bot's profile name, validated against the live roster."""
+    out = subprocess.run([str(WATCH), "--once"], capture_output=True, text=True, timeout=30)
+    if out.returncode != 0 or not out.stdout.strip():
+        detail = out.stderr.strip() or out.stdout.strip()
+        raise RuntimeError(f"hermesbots-watch failed: {detail[:200]}")
+    snap = json.loads(out.stdout.splitlines()[-1])
+    wanted = (name or "").lstrip("@").strip().lower()
+    for bot in snap.get("bots", []):
+        if bot["name"].lower() == wanted or (bot.get("title") or "").lower() == wanted:
+            return bot
+    raise RuntimeError(f"no bot named {name!r} in the roster")
+
+
+def command_for(bot, query_file):
+    cmd = ["hermes"]
+    if bot["name"] != "default":
+        cmd += ["-p", bot["name"]]
+    cmd += [
+        "chat",
+        "--in", str(Path.home()),
+        "-c", BOT_CHAT,
+        "--create-if-missing",
+        "-Q",
+        "--query-file", str(query_file),
+    ]
+    return cmd
+
+
+def query_dir():
+    path = STATE / "sends"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def prune_query_files(max_age_s=86400):
+    """Drop yesterday's message files - they hold user text and must not pile up."""
+    cutoff = time.time() - max_age_s
+    try:
+        for old in query_dir().glob("send-*.txt"):
+            if old.stat().st_mtime < cutoff:
+                old.unlink()
+    except OSError:
+        pass
+
+
+def write_query_file(text):
+    """The message as a file hermes reads with --query-file.
+
+    It must SURVIVE the spawn: the detached child reads it after we return, so
+    an unlink here is a race (the turn dies with "cannot read --query-file").
+    Kept under the state dir at 0600 and pruned by the next run instead.
+    """
+    handle, name = tempfile.mkstemp(prefix="send-", suffix=".txt", dir=str(query_dir()))
+    os.close(handle)
+    path = Path(name)
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Send a message into a bot's canonical Bot Chat.")
+    ap.add_argument("--bot", required=True, help="bot name (Hermes profile) or @handle")
+    ap.add_argument("--text", default=None, help="message text (default: read stdin)")
+    ap.add_argument("--wait", action="store_true", help="run in the foreground and print the reply")
+    ap.add_argument("--print", dest="dry_run", action="store_true", help="print the command instead of running it")
+    ap.add_argument("--json", action="store_true", help="machine-readable result")
+    args = ap.parse_args(argv)
+
+    text = args.text if args.text is not None else sys.stdin.read()
+    if not text.strip():
+        return _fail(args, "empty message")
+    try:
+        bot = resolve(args.bot)
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        return _fail(args, str(exc))
+
+    prune_query_files()
+    query_file = write_query_file(text)
+    cmd = command_for(bot, query_file)
+    result = {
+        "bot": bot["name"],
+        "session_id": bot["chat"]["session_id"],
+        "created_chat": not bot["chat"]["exists"],
+        "command": " ".join(cmd),
+        "text_chars": len(text),
+        "mode": "wait" if args.wait else "detached",
+        "pid": None,
+        "reply": None,
+    }
+
+    if args.dry_run:
+        try:
+            query_file.unlink()
+        except OSError:
+            pass
+        result["mode"] = "dry-run"
+        print(json.dumps(result, ensure_ascii=False) if (args.json or args.dry_run) else result["command"])
+        return 0
+
+    env = {**os.environ, "HERMESBOTS_SEND_FILE": str(query_file)}
+    if args.wait:
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(Path.home()))
+        result["reply"] = (proc.stdout or "").strip()[-4000:]
+        result["exit_code"] = proc.returncode
+        if proc.returncode != 0:
+            result["stderr"] = (proc.stderr or "").strip()[-1000:]
+            log(f"{bot['name']}: wait failed rc={proc.returncode}")
+    else:
+        # Detached: the widget must return instantly, and the reply is announced
+        # by hermesbots-watch, not printed into a bar process that has exited.
+        logf = STATE / "send.out"
+        STATE.mkdir(parents=True, exist_ok=True)
+        with logf.open("a", encoding="utf-8") as fh:
+            proc = subprocess.Popen(
+                cmd, stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                start_new_session=True, env=env, cwd=str(Path.home()),
+            )
+        result["pid"] = proc.pid
+        log(f"{bot['name']}: sent {len(text)} chars, pid={proc.pid}")
+
+    if args.wait:
+        # Only safe once the child has finished reading it.
+        try:
+            query_file.unlink()
+        except OSError:
+            pass
+    else:
+        result["query_file"] = str(query_file)
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+    elif args.wait:
+        print(result["reply"] or "")
+    else:
+        print(f"sent to {bot['handle']} (pid {result['pid']})")
+    return 0 if result.get("exit_code", 0) == 0 else 1
+
+
+def _fail(args, message):
+    if args.json or args.dry_run:
+        print(json.dumps({"error": message}, ensure_ascii=False))
+    else:
+        print(f"hermesbots-send: {message}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

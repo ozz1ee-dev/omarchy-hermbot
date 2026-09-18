@@ -1,0 +1,722 @@
+#!/usr/bin/env python3
+# hermesbots-watch - follow the local Hermes install and stream its Bot Mode
+# roster as JSON lines.
+#
+#   stdout  {"generated_ts":..., "gateway":{...}, "counts":{...}, "bots":[...]}
+#   args    --once            print one snapshot and exit
+#           --interval N      seconds between polls (default 5)
+#           --pretty          human-readable JSON instead of one line
+#           --state PATH      state file for notification transitions (default
+#                             ~/.local/state/omarchy/hermesbots/notify.json)
+#           --notify          emit omarchy notifications on state transitions
+#           --hermes-root P   override ~/.hermes
+#
+# Everything read here is local and read-only: each profile's config
+# (profile.yaml, gateway_state.json) and its session database opened with
+# mode=ro. Nothing is written to a profile, nothing leaves the machine, and no
+# network call is ever made - unlike Rakazo, the Hermes roster needs no token.
+#
+# A "bot" is a Hermes profile (Bot Mode's primitive). What the desktop shows in
+# its Bots pane is what this emits: avatar metadata from profile.yaml's
+# ui_meta['hermes-bots'], plus the one canonical chat that identifies the
+# relationship - the session titled exactly "Bot Chat" (always born hidden).
+# "Waiting on you" is the desktop's own watermark: last_activity_at past
+# last_read_at. "Active now" mirrors the roster's activity filter (a write in
+# the last 90s).
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import zlib
+from pathlib import Path
+
+DEFAULT_ROOT = Path.home() / ".hermes"
+DEFAULT_STATE = Path.home() / ".local/state/omarchy/hermesbots/notify.json"
+BOT_CHAT_TITLE = "Bot Chat"      # canonical chat title (tui_gateway contract)
+ACTIVE_WINDOW_S = 90             # desktop roster: "wrote within the last 90s"
+PREVIEW_CHARS = 160
+HANDLE_DEFAULT = "hermes"        # @hermes is the default profile's alias
+
+
+# ── small helpers ───────────────────────────────────────────────────────────
+
+
+def _read_yaml_flat(path):
+    """Minimal YAML reader for the two files we care about.
+
+    profile.yaml and gateway_state.json are machine-written and shallow, so we
+    avoid a PyYAML dependency (the bar must run on a stock python3). Anything
+    unparsable degrades to {} rather than raising.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    # Indentation-based parse, enough for nested maps of scalars.
+    out = {}
+    stack = [(-1, out)]
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        line = raw.strip()
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip().strip("'\"")
+        value = value.strip()
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1] if stack else out
+        if value == "":
+            child = {}
+            parent[key] = child
+            stack.append((indent, child))
+        else:
+            parent[key] = _scalar(value)
+    return out
+
+
+def _scalar(value):
+    value = value.strip()
+    if value in ("true", "True"):
+        return True
+    if value in ("false", "False"):
+        return False
+    if value in ("null", "~", ""):
+        return None
+    if (value.startswith("'") and value.endswith("'")) or (
+        value.startswith('"') and value.endswith('"')
+    ):
+        return value[1:-1]
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    return value
+
+
+def _hsl_to_hex(text):
+    """'hsl(349 68% 58%)' → '#d1435b' so QML can paint it directly."""
+    try:
+        inside = text[text.index("(") + 1 : text.index(")")]
+    except ValueError:
+        return None
+    parts = inside.replace(",", " ").replace("/", " ").split()
+    nums = []
+    for part in parts:
+        part = part.strip().rstrip("%")
+        try:
+            nums.append(float(part))
+        except ValueError:
+            return None
+    if len(nums) < 3:
+        return None
+    h, s, l = nums[0] % 360.0, min(max(nums[1] / 100.0, 0.0), 1.0), min(max(nums[2] / 100.0, 0.0), 1.0)
+    c = (1 - abs(2 * l - 1)) * s
+    x = c * (1 - abs((h / 60.0) % 2 - 1))
+    m = l - c / 2
+    table = [
+        (c, x, 0), (x, c, 0), (0, c, x),
+        (0, x, c), (x, 0, c), (c, 0, x),
+    ][int(h // 60) % 6]
+    r, g, b = (int(round((v + m) * 255)) for v in table)
+    return "#%02x%02x%02x" % (r, g, b)
+
+
+def color_hex(value):
+    """Normalize any avatar color the desktop may store to '#rrggbb'."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.startswith("#"):
+        return text if len(text) in (4, 7) else None
+    if text.lower().startswith("hsl"):
+        return _hsl_to_hex(text)
+    if text.lower().startswith("rgb"):
+        try:
+            nums = [int(round(float(n))) for n in text[text.index("(") + 1 : text.index(")")].replace(",", " ").split()]
+        except (ValueError, IndexError):
+            return None
+        if len(nums) >= 3:
+            return "#%02x%02x%02x" % tuple(max(0, min(255, n)) for n in nums[:3])
+    return None
+
+
+def _clean_preview(text):
+    if not text:
+        return ""
+    text = " ".join(str(text).split())
+    return text[:PREVIEW_CHARS] + ("…" if len(text) > PREVIEW_CHARS else "")
+
+
+# ── profiles (bots) ─────────────────────────────────────────────────────────
+
+
+def profiles_root(root):
+    return root / "profiles"
+
+
+def bot_homes(root):
+    """(name, home) for the default profile plus every live named profile.
+
+    Mirrors the desktop: a named profile counts only when its directory carries
+    an identity marker, so infra dirs (sessions/, logs/) never appear as bots.
+    """
+    homes = [("default", root)]
+    markers = ("config.yaml", ".env", "SOUL.md", "profile.yaml", "auth.json", "state.db")
+    try:
+        entries = sorted(p for p in profiles_root(root).iterdir() if p.is_dir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        if entry.name.startswith("."):
+            continue
+        if any((entry / marker).exists() or (entry / marker).is_symlink() for marker in markers):
+            homes.append((entry.name, entry))
+    return homes
+
+
+def bot_meta(home_path, name):
+    meta = _read_yaml_flat(home_path / "profile.yaml")
+    ui = (meta.get("ui_meta") or {}).get("hermes-bots") or {}
+    shape = ui.get("shape")
+    return {
+        "name": name,
+        "handle": "@" + (HANDLE_DEFAULT if name == "default" else name),
+        "title": ui.get("title") or name,
+        "description": (meta.get("description") or "").strip() or None,
+        "shape": shape,
+        "color": color_hex(ui.get("color")),
+        "image_kind": ui.get("imageKind") or "shape",
+        "custom": bool(ui.get("custom")),
+        "created": ui.get("created"),
+        "bot_mode": bool(ui),
+    }
+
+
+def gateway_status(root):
+    state = _read_yaml_flat(root / "gateway_state.json")
+    pid = state.get("pid")
+    alive = False
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except OSError:
+            alive = False
+    return {
+        "pid": pid,
+        "running": alive and state.get("gateway_state") == "running",
+        "state": state.get("gateway_state"),
+        "profiles": state.get("served_profiles") or [],
+        "active_agents": state.get("active_agents"),
+        "updated_at": state.get("updated_at"),
+    }
+
+
+# ── session store ───────────────────────────────────────────────────────────
+
+
+def open_store(home_path):
+    db = home_path / "state.db"
+    if not db.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+        con.execute("PRAGMA query_only = 1")
+        return con
+    except sqlite3.Error:
+        return None
+
+
+def session_unread(last_activity, last_read):
+    """Unread, exactly as the backend derives it (SessionDB.session_unread).
+
+    ``last_read_at`` is a watermark: NULL = never tracked = READ, 0 = explicitly
+    marked unread, otherwise unread when activity postdates the watermark.
+    Getting this backwards paints every bot as "waiting on you" forever.
+    """
+    if last_read is None:
+        return False
+    return float(last_activity or 0) > float(last_read)
+
+
+def newest_activity(con):
+    """(ts, session_id, title) of the bot's freshest conversation.
+
+    The desktop orders and pulses rows on the newest message in ANY of a bot's
+    sessions (canonical chat, side chats, cron runs), not just the Bot Chat.
+    """
+    if con is None:
+        return (0.0, None, None)
+    try:
+        row = con.execute(
+            "SELECT last_activity_at, id, title FROM sessions WHERE archived = 0"
+            " ORDER BY last_activity_at DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return (0.0, None, None)
+    if not row:
+        return (0.0, None, None)
+    return (float(row[0] or 0), row[1], row[2])
+
+
+def recent_visible_session(con):
+    """The newest session a deep link can actually open.
+
+    Canonical Bot Chats are always hidden, and the desktop's route validation
+    refuses a session id that is not in its loaded (visible) list - so a link
+    into a Bot Chat is dropped silently. The newest visible session IS
+    openable, which is exactly what the roster's own right-click does.
+    """
+    if con is None:
+        return None
+    try:
+        row = con.execute(
+            "SELECT id, title, last_activity_at FROM sessions"
+            " WHERE archived = 0 AND hidden = 0 ORDER BY last_activity_at DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    return {"session_id": row[0], "title": row[1], "last_activity_at": float(row[2] or 0)}
+
+
+A2A_RE = re.compile(r"^Message from (?:agent '([^']+)'|\U0001f916\s*([^\s(@]+))", re.I)
+
+
+def preview_sender(preview):
+    """Handle of the bot that sent a bot-to-bot DM, or None for a human thread.
+
+    Mirrors the desktop's previewKind(): a preview carrying the delivery prefix
+    is a DM, so the row should show who wrote rather than presenting it as the
+    user's chat.
+    """
+    match = A2A_RE.match((preview or "").strip())
+    if not match:
+        return None
+    name = (match.group(1) or match.group(2) or "").strip().lower()
+    if not name or name == "default":
+        return "@" + HANDLE_DEFAULT
+    return "@" + name
+
+
+def canonical_chat(con, profile_name):
+    """The one chat that identifies a bot: the session titled exactly "Bot Chat".
+
+    Same lookup the desktop performs (`session.list {title, include_hidden}`),
+    read straight out of the store so the widget needs no running backend.
+    """
+    if con is None:
+        return None
+    try:
+        row = con.execute(
+            "SELECT id, title, last_activity_at, last_read_at, message_count,"
+            " pinned, hidden, archived, ended_at"
+            " FROM sessions WHERE title = ?"
+            + (" AND profile_name = ?" if profile_name != "default" else "")
+            + " ORDER BY last_activity_at DESC LIMIT 1",
+            (BOT_CHAT_TITLE, profile_name) if profile_name != "default" else (BOT_CHAT_TITLE,),
+        ).fetchone()
+    except sqlite3.Error:
+        try:
+            row = con.execute(
+                "SELECT id, title, last_activity_at, last_read_at, message_count,"
+                " pinned, hidden, archived, ended_at FROM sessions WHERE title = ?"
+                " ORDER BY last_activity_at DESC LIMIT 1",
+                (BOT_CHAT_TITLE,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+    if not row:
+        return None
+    (sid, _title, last_activity, last_read, count, pinned, hidden, archived, ended) = row
+    preview, preview_role, preview_ts = latest_message(con, sid)
+    last_activity = float(last_activity or 0)
+    return {
+        "session_id": sid,
+        "exists": True,
+        "hidden": bool(hidden),
+        "pinned": bool(pinned),
+        "archived": bool(archived),
+        "ended": bool(ended),
+        "message_count": int(count or 0),
+        "last_activity_at": last_activity,
+        "last_read_at": last_read,
+        "unread": session_unread(last_activity, last_read),
+        "preview": preview,
+        "preview_role": preview_role,
+        "preview_ts": preview_ts,
+        "from_bot": preview_sender(preview),
+    }
+
+
+def latest_message(con, session_id):
+    """(preview, role, ts) of the newest real turn in a session.
+
+    Tool plumbing is skipped: only user/assistant text counts as something the
+    roster should preview.
+    """
+    try:
+        rows = con.execute(
+            "SELECT role, content, timestamp FROM messages"
+            " WHERE session_id = ? AND role IN ('user', 'assistant')"
+            " AND content IS NOT NULL AND content != ''"
+            " ORDER BY id DESC LIMIT 8",
+            (session_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return ("", None, None)
+    for role, content, ts in rows:
+        text = content
+        if isinstance(text, str) and text.lstrip().startswith(("{", "[")):
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                text = parsed.get("text") or parsed.get("content") or ""
+            elif isinstance(parsed, list):
+                text = " ".join(
+                    part.get("text", "")
+                    for part in parsed
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+        cleaned = _clean_preview(text)
+        if cleaned.strip():
+            return (cleaned, role, ts)
+    return ("", None, None)
+
+
+def snapshot(root):
+    now = time.time()
+    gw = gateway_status(root)
+    served = set(gw["profiles"])
+    bots = []
+    for name, home_path in bot_homes(root):
+        con = open_store(home_path)
+        try:
+            bot = bot_meta(home_path, name)
+            chat = canonical_chat(con, name) if con else None
+            newest_ts, newest_sid, _newest_title = newest_activity(con)
+            recent = recent_visible_session(con)
+        finally:
+            if con is not None:
+                con.close()
+        if chat is None:
+            chat = {
+                "session_id": None, "exists": False, "hidden": True, "pinned": False,
+                "archived": False, "ended": False, "message_count": 0,
+                "last_activity_at": 0, "last_read_at": None, "unread": False,
+                "preview": "", "preview_role": None, "preview_ts": None, "from_bot": None,
+            }
+        # Roster ordering/activity: newest of (bot created, newest message in any
+        # of its sessions) - the desktop's own sortRosterBots().
+        created_ms = bot.get("created") or 0
+        activity = max(float(created_ms) / 1000.0, newest_ts or 0.0)
+        bot.update(
+            {
+                "gateway_served": name in served,
+                "chat": chat,
+                "waiting": bool(chat["exists"] and chat["unread"]),
+                "active": bool(newest_ts and (now - newest_ts) < ACTIVE_WINDOW_S),
+                "activity_at": activity,
+                "newest_session_id": newest_sid,
+                "recent_session": recent,
+                "hermes_cmd": _hermes_cmd(name),
+                "open": {
+                    "session_id": chat["session_id"],
+                    # Deep link into the canonical Bot Chat. The desktop's route
+                    # validation drops a HIDDEN session id, so this link only
+                    # works once the app grows a door for bot chats - the ladder
+                    # in hermesbots-open knows that and prefers recent_session.
+                    "deep_link": (
+                        f"hermes://open/{chat['session_id']}?profile={name}"
+                        if chat["session_id"] else None
+                    ),
+                    "recent_deep_link": (
+                        f"hermes://open/{recent['session_id']}?profile={name}"
+                        if recent else None
+                    ),
+                },
+            }
+        )
+        bots.append(bot)
+    bots.sort(key=lambda b: (not b["active"], not b["waiting"], -(b["activity_at"] or 0)))
+    return {
+        "generated_ts": now,
+        "source": "local",
+        "hermes_root": str(root),
+        "gateway": gw,
+        "counts": {
+            "bots": len(bots),
+            "waiting": sum(1 for b in bots if b["waiting"]),
+            "active": sum(1 for b in bots if b["active"]),
+            "no_chat": sum(1 for b in bots if not b["chat"]["exists"]),
+        },
+        "bots": bots,
+    }
+
+
+def _hermes_cmd(name):
+    """The CLI door to this bot - the same agent the desktop opens."""
+    return "hermes" + ("" if name == "default" else f" -p {name}") + " chat"
+
+
+# ── notifications (state transitions only) ──────────────────────────────────
+
+
+def load_state(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"bots": {}}
+
+
+def save_state(path, snap):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_ts": snap["generated_ts"],
+        "bots": {
+            b["name"]: {
+                "activity_at": b["activity_at"],
+                "preview": b["chat"]["preview"],
+                "preview_role": b["chat"]["preview_role"],
+                "message_count": b["chat"]["message_count"],
+                "unread": b["chat"]["unread"],
+            }
+            for b in snap["bots"]
+        },
+    }
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def transitions(prev, snap):
+    """Bots that just wrote - one card per change, written by the bot.
+
+    A card is only raised when the bot's canonical chat gained a message AND the
+    newest message is the bot's own (or a bot-to-bot DM): being told about the
+    message you just sent from the widget is noise. The first run seeds the
+    world and announces nothing.
+    """
+    if not prev or not prev.get("bots"):
+        return []
+    events = []
+    for bot in snap["bots"]:
+        before = prev["bots"].get(bot["name"])
+        if before is None:
+            continue
+        chat = bot["chat"]
+        if not chat["exists"] or not chat["preview"]:
+            continue
+        if (chat["message_count"] or 0) <= (before.get("message_count") or 0):
+            continue
+        if chat["preview_role"] != "assistant" and not chat.get("from_bot"):
+            continue
+        if chat["preview"] == before.get("preview") and chat["preview_role"] == before.get("preview_role"):
+            continue
+        events.append(
+            {
+                "name": bot["name"],
+                "title": bot["title"],
+                "color": bot["color"],
+                "preview": chat["preview"],
+                "role": chat["preview_role"],
+                "from_bot": chat.get("from_bot"),
+                "waiting": bot["waiting"],
+                "session_id": chat["session_id"],
+            }
+        )
+    return events
+
+
+def notification_sender():
+    return shutil.which("omarchy-notification-send")
+
+
+def opener_path():
+    """The click target, as an absolute path (a bar process has no bin/ on PATH)."""
+    return os.environ.get("HERMESBOTS_OPEN") or str(Path(__file__).resolve().parent / "hermesbots-open")
+
+
+def icon_arg():
+    """The icon to stamp on a card: our own PNG when shipped, else an icon name.
+
+    A bar widget is often instantiated twice, so the asset is located relative to
+    this script (bin/../assets) rather than from the plugin's cwd.
+    """
+    asset = Path(__file__).resolve().parent.parent / "assets" / "hermesbots.png"
+    if asset.is_file():
+        return str(asset)
+    for candidate in ("hermesbots", "hermes"):
+        for root in ("/usr/share/icons", str(Path.home() / ".local/share/icons"), "/usr/share/omarchy"):
+            try:
+                if Path(root).exists() and next(Path(root).rglob(candidate + ".*"), None):
+                    return candidate
+            except OSError:
+                continue
+    return None
+
+
+def notify_log(line):
+    try:
+        path = Path(DEFAULT_STATE).parent / "notify.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line.rstrip()}\n")
+    except OSError:
+        pass
+
+
+def replace_id(name):
+    """A stable numeric id per bot.
+
+    The sender rejects a non-numeric -r ("Invalid -r value"), so a per-bot int
+    is how a chatty bot replaces its own previous card instead of stacking.
+    """
+    return 1000 + (zlib.crc32(name.encode("utf-8")) % 100000)
+
+
+def notify(event):
+    """One desktop notification per bot write: its own app name, a click that
+    opens that bot, and a replace id so a chatty bot cannot stack twenty cards.
+
+    Order matters: the sender consumes `<headline> [description]` BEFORE
+    `--exec`, and everything after --exec belongs to the launched program.
+    Failures are logged, never swallowed silently - a missing sender or a
+    rejected flag must be visible, not "the widget just stopped notifying".
+    """
+    sender = notification_sender()
+    if not sender:
+        notify_log("no omarchy-notification-send on PATH - notifications disabled")
+        return False
+    cmd = [sender, "--app-name", "Hermesbots", "-u", "normal",
+           "-r", str(replace_id(event["name"]))]
+    icon = icon_arg()
+    if icon:
+        cmd += ["-i", icon]
+    cmd += [event["title"], event["preview"],
+            "--exec", opener_path(), "--bot", event["name"], "--select"]
+    try:
+        out = subprocess.run(cmd, check=False, timeout=10, capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        notify_log(f"{event['name']}: sender failed: {exc}")
+        return False
+    if out.returncode != 0:
+        notify_log(f"{event['name']}: sender rc={out.returncode} {out.stderr.strip()[:200]}")
+        return False
+    notify_log(f"{event['name']}: card sent ({event['preview'][:40]!r})")
+    return True
+
+
+# ── main ────────────────────────────────────────────────────────────────────
+
+
+def acquire_state_lock(state_path, attempts=5, delay=0.1):
+    """Serialize the notification state.
+
+    A bar widget is frequently instantiated twice, so two watchers can poll the
+    same install; without the lock both diff the same snapshot and post the same
+    card twice. Returns the held handle, or None when another instance owns it.
+    """
+    lock_path = Path(str(state_path) + ".lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("w")
+    except OSError:
+        return None
+    for _ in range(attempts):
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except OSError:
+            time.sleep(delay)
+    try:
+        handle.close()
+    except OSError:
+        pass
+    return None
+
+
+def release_state_lock(handle):
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        handle.close()
+    except OSError:
+        pass
+
+
+def emit(snap, pretty):
+    if pretty:
+        print(json.dumps(snap, ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(snap, ensure_ascii=False), flush=True)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Follow the local Hermes Bot Mode roster.")
+    ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
+    ap.add_argument("--interval", type=float, default=5.0, help="seconds between polls")
+    ap.add_argument("--pretty", action="store_true", help="pretty-print each snapshot")
+    ap.add_argument("--state", default=str(DEFAULT_STATE), help="notification state file")
+    ap.add_argument("--notify", action="store_true", help="send omarchy notifications on transitions")
+    ap.add_argument("--hermes-root", default=os.environ.get("HERMESBOTS_ROOT", str(DEFAULT_ROOT)))
+    args = ap.parse_args(argv)
+
+    root = Path(args.hermes_root).expanduser()
+    while True:
+        try:
+            snap = snapshot(root)
+        except Exception as exc:  # never take the bar down with us
+            err = {"generated_ts": time.time(), "error": f"{type(exc).__name__}: {exc}", "bots": [], "counts": {}}
+            emit(err, args.pretty)
+            if args.once:
+                return 1
+            time.sleep(max(args.interval, 1.0))
+            continue
+        handle = acquire_state_lock(args.state)
+        try:
+            if args.notify:
+                prev = load_state(args.state)
+                for event in transitions(prev, snap):
+                    # A notification backend failure must never take the watcher
+                    # (and with it the bar widget) down mid-poll.
+                    try:
+                        notify(event)
+                    except Exception as exc:  # noqa: BLE001 - log and carry on
+                        notify_log(f"{event.get('name')}: notify raised {type(exc).__name__}: {exc}")
+            save_state(args.state, snap)
+        finally:
+            release_state_lock(handle)
+        emit(snap, args.pretty)
+        if args.once:
+            return 0
+        time.sleep(max(args.interval, 1.0))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
