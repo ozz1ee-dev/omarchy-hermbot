@@ -58,6 +58,17 @@ jobs:
           fi
           echo "qmllint rc=$rc, no errors (warnings are expected for a Quickshell widget)"
 
+  portability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: the plugin adapts to a machine that is not ours
+        # Runs the watcher inside a throwaway "foreign" world (its own HERMES_HOME
+        # and XDG_* directories) on a runner that has neither Omarchy nor Hermes
+        # installed: if the code ever assumes the author's machine again, this job
+        # fails here instead of on a stranger's laptop.
+        run: python3 scripts/check-portability.py
+
   ascii:
     runs-on: ubuntu-latest
     steps:

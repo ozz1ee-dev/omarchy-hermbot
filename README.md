@@ -37,8 +37,29 @@ is Rakabot's, adapted - see `NOTICE` for the lineage.
 ## Requirements
 
 - Omarchy (Quattro) with the bar, `omarchy-notification-send` on `PATH`
-- A local Hermes install (`~/.hermes`), gateway or desktop backend running
+- A Hermes install (`HERMES_HOME`, else `~/.hermes`), gateway or desktop backend running
 - `python3` (standard library only - no pip installs, no venv)
+
+## On someone else's machine
+
+Nothing here names a user, a home directory or an install path: the scripts find
+each other through their own location, and every directory they read follows the
+same environment the rest of the system uses.
+
+| what | where it comes from |
+|---|---|
+| the Hermes install | `HERMES_HOME`, else `~/.hermes` (when the variable is pinned to a single profile directory, which is what a profile-scoped process gets, it resolves up to the home) |
+| this plugin's own state | `${XDG_STATE_HOME:-~/.local/state}/omarchy/hermbot` |
+| Hermes Desktop's registry | `${XDG_CONFIG_HOME:-~/.config}/Hermes`, whichever copy actually holds a registry |
+| the packaged desktop binary | `HERMES_HOME/hermes-agent/apps/desktop/release`, overridable with `HERMBOT_DESKTOP_BIN` |
+| the roster | whatever instance the app is connected to (see the binaries below) |
+
+A profile counts as a bot only when its directory carries something Hermes writes
+(`config.yaml`, `profile.yaml`, `auth.json`, `state.db`, ...) - never a directory
+of sessions or logs - and a machine with no Hermes at all says so instead of
+inventing a bot. `python3 scripts/check-portability.py` builds such a foreign
+world in a temporary directory and checks all of it; CI runs the same script on a
+runner that has neither Omarchy nor Hermes installed.
 
 ## The three binaries
 
@@ -47,9 +68,9 @@ written to a profile and no credential is ever needed. There is no token to
 configure - unlike a hosted chat service, the Hermes roster is already on disk.
 When the desktop is pointed at an SSH host, that host's roster is read the same
 way: the watcher runs this same script there over one ssh connection it holds
-open, and the only thing written on the far side is a scratch file under `/tmp`
-that the copy there uses for its own state. Set `source` to `local` (or press
-`s`) to pin the bar to this machine regardless.
+open, and the only thing written on the far side is a scratch directory under
+`/tmp` that the copy there uses for its own state. Set `source` to `local` (or
+press `s`) to pin the bar to this machine regardless.
 
 ### `bin/hermbot-watch`
 

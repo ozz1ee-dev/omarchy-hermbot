@@ -24,9 +24,14 @@ import sys
 from pathlib import Path
 
 WATCH = Path(__file__).resolve().parent / "hermbot-watch"
-ELECTRON_BIN = Path.home() / ".hermes/hermes-agent/apps/desktop/release"
+_HERE = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+sys.path.insert(0, str(_HERE))
+import hermbot_paths  # noqa: E402  (a sibling script directory, resolved above)
+
+# Both follow the machine: HERMES_HOME for the install, XDG_STATE_HOME for state.
+ELECTRON_BIN = hermbot_paths.ROOT / "hermes-agent/apps/desktop/release"
 SCHEME = "hermes://"
-LOG = Path.home() / ".local/state/omarchy/hermbot/open.log"
+LOG = hermbot_paths.STATE_DIR / "open.log"
 
 
 def log(line):

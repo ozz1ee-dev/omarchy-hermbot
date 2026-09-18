@@ -40,14 +40,20 @@ import time
 import zlib
 from pathlib import Path
 
-DEFAULT_ROOT = Path.home() / ".hermes"
-DEFAULT_STATE = Path.home() / ".local/state/omarchy/hermbot/notify.json"
-DEFAULT_SEEN = Path.home() / ".local/state/omarchy/hermbot/seen.json"   # last opened, per bot
+_HERE = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+sys.path.insert(0, str(_HERE))
+import hermbot_paths  # noqa: E402  (a sibling script directory, resolved above)
+
 BOT_CHAT_TITLE = "Bot Chat"      # canonical chat title (tui_gateway contract)
 ACTIVE_WINDOW_S = 90             # desktop roster: "wrote within the last 90s"
 PREVIEW_CHARS = 160
-HANDLE_DEFAULT = "hermes"        # @hermes is the default profile's alias
-APPDATA = Path.home() / ".config" / "Hermes"   # Hermes Desktop's own state
+HANDLE_DEFAULT = "hermes"        # @hermes is the default profile's alias (botHandle in the app)
+# Every one of these can be somewhere else on somebody else's machine - see
+# hermbot_paths.py for which environment variable each one follows.
+DEFAULT_ROOT = hermbot_paths.ROOT
+DEFAULT_STATE = hermbot_paths.STATE_DIR / "notify.json"
+DEFAULT_SEEN = hermbot_paths.STATE_DIR / "seen.json"   # last opened, per bot
+APPDATA = hermbot_paths.APPDATA   # Hermes Desktop's own state
 
 
 # ── small helpers ───────────────────────────────────────────────────────────
@@ -177,14 +183,31 @@ def profiles_root(root):
     return root / "profiles"
 
 
+MARKERS = ("config.yaml", ".env", "SOUL.md", "profile.yaml", "auth.json", "state.db")
+
+
+def looks_like_install(path):
+    """Is there a Hermes install here?
+
+    The same marker rule the named profiles get. Without it a machine that has
+    no Hermes at all - or a mistyped HERMES_HOME - answered with one phantom
+    `default` bot instead of saying that there is nothing here.
+    """
+    try:
+        if not path.is_dir():
+            return False
+        return any((path / marker).exists() or (path / marker).is_symlink() for marker in MARKERS)
+    except OSError:
+        return False
+
+
 def bot_homes(root):
     """(name, home) for the default profile plus every live named profile.
 
-    Mirrors the desktop: a named profile counts only when its directory carries
-    an identity marker, so infra dirs (sessions/, logs/) never appear as bots.
+    Mirrors the desktop: a profile counts only when its directory carries an
+    identity marker, so infra dirs (sessions/, logs/) never appear as bots.
     """
-    homes = [("default", root)]
-    markers = ("config.yaml", ".env", "SOUL.md", "profile.yaml", "auth.json", "state.db")
+    homes = [("default", root)] if looks_like_install(root) else []
     try:
         entries = sorted(p for p in profiles_root(root).iterdir() if p.is_dir())
     except OSError:
@@ -192,7 +215,7 @@ def bot_homes(root):
     for entry in entries:
         if entry.name.startswith("."):
             continue
-        if any((entry / marker).exists() or (entry / marker).is_symlink() for marker in markers):
+        if any((entry / marker).exists() or (entry / marker).is_symlink() for marker in MARKERS):
             homes.append((entry.name, entry))
     return homes
 
@@ -619,6 +642,12 @@ def snapshot(root, seen=None):
     """
     now = time.time()
     seen = seen or {}
+    if not looks_like_install(root):
+        # Nothing to show, and saying so beats a phantom bot: the widget turns
+        # this into a short header and keeps the mark dimmed.
+        return {"generated_ts": now, "error": "no Hermes install here",
+                "error_detail": f"{root} does not look like a Hermes home",
+                "gateway": gateway_status(root), "bots": [], "counts": {}}
     gw = gateway_status(root)
     served = set(gw["profiles"])
     bots = []
@@ -1000,6 +1029,11 @@ def settle(args, snap):
         release_state_lock(handle)
 
 
+def _source_label(target):
+    """How to name a source in one word inside a message."""
+    return str(target.get("label") or target.get("host") or target.get("id") or "remote")
+
+
 def stamp(snap, kind, target):
     """Name the instance this snapshot came from, for the panel's own header."""
     label = "this device" if kind == "local" else (target.get("label") or target.get("host") or "remote")
@@ -1032,7 +1066,7 @@ def source_of(args):
             "id": row.get("id") or pick,
             "label": row.get("label") or host,
             "host": host,
-            "user": row.get("user") or "root",
+            "user": row.get("user") or os.environ.get("USER") or "root",
             "port": row.get("port"),
             "key_path": row.get("keyPath"),
         }
@@ -1057,6 +1091,42 @@ def source_changed(args, kind, target):
     return (now_target.get("id"), now_target.get("host")) != (target.get("id"), target.get("host"))
 
 
+def _remote_payload():
+    """Everything the far side needs, as one script to feed to `python3 -`.
+
+    The watcher imports its sibling module, so streaming the bare script is not
+    enough any more. The payload unpacks the whole little bundle into one
+    deterministic scratch directory under the remote's /tmp (replaced on every
+    reconnect, so nothing accumulates) and execs the watcher from there - which
+    is also what makes `__file__` and the sibling import resolve.
+    """
+    import base64
+    import io
+    import tarfile
+
+    here = Path(__file__).resolve().parent
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name in ("hermbot_paths.py", Path(__file__).name):
+            tar.add(here / name, arcname=name)
+    blob = base64.b64encode(buf.getvalue()).decode("ascii")
+    return (
+        "import base64, io, os, pathlib, shutil, sys, tarfile, tempfile\n"
+        f"blob = {blob!r}\n"
+        "d = os.path.join(tempfile.gettempdir(), 'hermbot-watch-%d' % os.getuid())\n"
+        "shutil.rmtree(d, ignore_errors=True)\n"
+        "os.makedirs(d, exist_ok=True)\n"
+        "with tarfile.open(fileobj=io.BytesIO(base64.b64decode(blob))) as tar:\n"
+        "    try:\n"
+        "        tar.extractall(d, filter='data')\n"
+        "    except TypeError:\n"
+        "        tar.extractall(d)\n"
+        "w = pathlib.Path(d, 'hermbot-watch')\n"
+        "w.chmod(0o700)\n"
+        "os.execv(sys.executable, [sys.executable, str(w)] + sys.argv[1:])\n"
+    )
+
+
 def ssh_stream(args, target):
     """Stream the roster from another machine by running THIS script there.
 
@@ -1073,14 +1143,15 @@ def ssh_stream(args, target):
         remote_args += ["--hermes-root", str(args.hermes_root)]
     remote_args += ["--state", "/tmp/hermbot-remote-notify.json",
                     "--seen", "/tmp/hermbot-remote-seen.json"]
-    script = Path(__file__).read_text(encoding="utf-8")
+    script = _remote_payload()
     while True:
         try:
             proc = subprocess.Popen(ssh_argv(target, remote_args), stdin=subprocess.PIPE,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     text=True, bufsize=1)
         except OSError as exc:
-            emit(stamp({"generated_ts": time.time(), "error": f"ssh failed: {exc}",
+            emit(stamp({"generated_ts": time.time(), "error": f"{_source_label(target)} unreachable",
+                        "error_detail": f"ssh failed: {exc}",
                         "bots": [], "counts": {}}, "ssh", target), args.pretty)
             if args.once:
                 return 1
@@ -1124,7 +1195,8 @@ def ssh_stream(args, target):
             proc.kill()
         notify_log(f"source ssh:{target.get('id')}: stream ended ({detail[:160]!r})")
         emit(stamp({"generated_ts": time.time(),
-                    "error": detail[:200] or "the other machine answered nothing",
+                    "error": f"{_source_label(target)} unreachable",
+                    "error_detail": detail[:200] or "the other machine answered nothing",
                     "bots": [], "counts": {}}, "ssh", target), args.pretty)
         if args.once:
             return 1
@@ -1138,7 +1210,8 @@ def local_stream(args, kind, target):
         try:
             snap = stamp(snapshot(root, load_seen(args.seen)), kind, target)
         except Exception as exc:  # never take the bar down with us
-            err = {"generated_ts": time.time(), "error": f"{type(exc).__name__}: {exc}",
+            err = {"generated_ts": time.time(), "error": "this device unreadable",
+                   "error_detail": f"{type(exc).__name__}: {exc}",
                    "bots": [], "counts": {}}
             emit(stamp(err, kind, target), args.pretty)
             if args.once:

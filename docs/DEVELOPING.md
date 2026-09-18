@@ -19,6 +19,20 @@ ssh tunnel as the signal either: the app's ControlMaster outlives a switch by
 `ControlPersist` (measured: the forwarded port was still listening after the
 window had gone back to this machine).
 
+**Machine-independent by construction.** Nothing names a user, a home or an
+install path. The three scripts find each other through their own location, and
+`bin/hermbot_paths.py` resolves the four directories they need from the same
+environment the rest of the system reads: `HERMES_HOME` (else `~/.hermes`),
+`XDG_STATE_HOME` (else `~/.local/state`), `XDG_CONFIG_HOME` (else `~/.config`).
+Two traps that cost real debugging: `HERMES_HOME` may be pinned to a *profile*
+directory (that is what a profile-scoped process gets), so a value whose parent
+is `profiles/` resolves up to the home; and a profile is only a bot when its
+directory carries a marker Hermes writes, which is also what stops a machine
+with no Hermes from answering with one phantom `default` bot. Copy the whole
+`bin/` directory when installing by hand - the scripts import their sibling, and
+a single file piped into `python3` cannot carry it (the ssh transport sends both
+files as one bundle for exactly this reason).
+
 **It only ever reads.** The roster, the avatars and the conversations come from
 the Hermes Desktop install the widget is following - this machine, or the SSH
 host the app is connected to (the watcher streams this same script there over one

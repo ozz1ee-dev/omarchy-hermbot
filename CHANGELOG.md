@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.2
+
+- The plugin no longer assumes this machine. `HERMES_HOME`, `XDG_STATE_HOME` and
+  `XDG_CONFIG_HOME` are respected, each falling back to the stock path, so a
+  moved install, a relocated state directory and a desktop whose registry lives
+  outside `~/.config` are read correctly. `HERMES_HOME` pinned to a single
+  profile directory - what a profile-scoped process gets - resolves up to the
+  home instead of reading that one profile as the default bot.
+- A machine with no Hermes at all now says `no Hermes install here` instead of
+  answering with one phantom `default` bot: the marker rule the named profiles
+  already had now applies to the home too.
+- The ssh transport sends the whole `bin/` bundle rather than the bare watcher,
+  because the watcher imports its sibling paths module; the copy on the other
+  machine now lives in one deterministic scratch directory under `/tmp` instead
+  of a file, and nothing accumulates across reconnects.
+- `python3 scripts/check-portability.py` builds a foreign machine in a temporary
+  directory (its own `HERMES_HOME`, `XDG_*` directories and bot names) and checks
+  every one of those cases; CI runs it on a runner with neither Omarchy nor
+  Hermes installed, so an assumption about the author's machine fails there.
+
 ## 0.3.1
 
 - Fixed: switching the instance in the Hermes Desktop window left the bar on the

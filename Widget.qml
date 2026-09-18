@@ -929,7 +929,7 @@ Panel {
                 text: {
                   if (root.demoMode) return "HERMBOT · demo roster"
                   if (!root.snap) return "starting…"
-                  if (root.sourceError) return "HERMBOT · " + (root.instanceLabel || "source") + " unreachable"
+                  if (root.sourceError) return "HERMBOT · " + root.sourceError
                   if (root.sourceWarning) return "HERMBOT · " + root.sourceWarning + " · local only"
                   if (!root.gatewayUp) return "HERMBOT · gateway down"
                   if (root.remoteSource) return "HERMBOT · " + root.instanceLabel

@@ -24,7 +24,11 @@ import time
 from pathlib import Path
 
 WATCH = Path(__file__).resolve().parent / "hermbot-watch"
-STATE = Path.home() / ".local/state/omarchy/hermbot"
+_HERE = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+sys.path.insert(0, str(_HERE))
+import hermbot_paths  # noqa: E402  (a sibling script directory, resolved above)
+
+STATE = hermbot_paths.STATE_DIR
 SEND_LOG = STATE / "send.log"
 BOT_CHAT = "Bot Chat"
 

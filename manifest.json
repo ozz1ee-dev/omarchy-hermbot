@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ozz1ee.hermbot",
   "name": "Hermbot",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "author": "ozz1ee",
   "license": "Apache-2.0",
   "description": "Your Hermes Bot Mode roster in the bar: every bot drawn as its own avatar, the newest thing it said, and one click to reach it.",
