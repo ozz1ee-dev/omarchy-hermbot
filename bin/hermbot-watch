@@ -305,6 +305,28 @@ def newest_activity(con):
     return (float(row[0] or 0), row[1], row[2])
 
 
+def as_float(value, default=0.0):
+    """A number from a state file, or the default.
+
+    Every value here comes off disk, and a state file can be truncated by a crash,
+    hand-edited, or written by an older version - a `float()` straight on it takes
+    the whole watcher down (and with it the widget) instead of degrading to "no
+    stamp", which is the honest reading of a stamp we cannot parse.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def as_int(value, default=0):
+    """The same, for counts: unreadable means zero, never a crash."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def recent_visible_session(con):
     """The newest session a deep link can actually open.
 
@@ -312,19 +334,24 @@ def recent_visible_session(con):
     refuses a session id that is not in its loaded (visible) list - so a link
     into a Bot Chat is dropped silently. The newest visible session IS
     openable, which is exactly what the roster's own right-click does.
+
+    `message_count` rides along because this is also the row the unread badge is
+    measured against: the badge has to describe the conversation the click can
+    reach, not one the bar has no door to.
     """
     if con is None:
         return None
     try:
         row = con.execute(
-            "SELECT id, title, last_activity_at FROM sessions"
+            "SELECT id, title, last_activity_at, message_count FROM sessions"
             " WHERE archived = 0 AND hidden = 0 ORDER BY last_activity_at DESC LIMIT 1"
         ).fetchone()
     except sqlite3.Error:
         return None
     if not row:
         return None
-    return {"session_id": row[0], "title": row[1], "last_activity_at": float(row[2] or 0)}
+    return {"session_id": row[0], "title": row[1], "last_activity_at": float(row[2] or 0),
+            "message_count": as_int(row[3])}
 
 
 A2A_RE = re.compile(r"^Message from (?:agent '([^']+)'|\U0001f916\s*([^\s(@]+))", re.I)
@@ -774,26 +801,27 @@ def apply_local_waiting(snap, seen, appdata=None, counts=None):
     read_state, desktop_available = desktop_read_state(appdata)
     waiting = 0
     for bot in snap["bots"]:
-        wrote = float(bot.get("wrote_at") or 0)
-        seen_at = float(seen.get(bot.get("name")) or 0)
+        wrote = as_float(bot.get("wrote_at"))
+        seen_at = as_float(seen.get(bot.get("name")))
         unseen = bool(wrote and written_after(wrote, seen_at))
-        chat = bot.get("chat") or {}
-        chat_id = chat.get("session_id")
-        chat_msgs = chat.get("message_count")
-        # The desktop's green dot, which is per profile and therefore applies to
-        # a bot on a remote instance too - it is the same profile name the app
-        # keys its own record on.
-        marked = session_is_unread(read_state, bot.get("name"), chat_id, chat_msgs)
+        row = bot.get("recent_session") or {}
+        row_id = row.get("session_id")
+        row_msgs = row.get("message_count")
+        # The desktop's green dot, which is per profile and therefore applies to a
+        # bot on a remote instance too - it is the same profile name the app keys
+        # its own record on. Measured against the row a click can open, exactly as
+        # the local path does: the hidden canonical chat has no door from the bar.
+        marked = session_is_unread(read_state, bot.get("name"), row_id, row_msgs)
         if marked:
             bot["desktop_unread"] = True
         # The desktop record exists only on the machine showing the bar, so the
         # fallback is decided here rather than on the remote.
         fallback = unseen and not desktop_available
-        bot["waiting"] = bool(chat.get("exists") and (chat.get("unread") or marked or fallback))
+        bot["waiting"] = bool(row_id and (marked or fallback))
         if bot["waiting"]:
-            total = int(chat.get("message_count") or 0)
-            baseline = (counts or {}).get(bot.get("name"))
-            bot["unread_count"] = 1 if baseline is None else max(1, total - int(baseline))
+            baseline = unread_baseline(read_state, bot.get("name"), row_id, counts)
+            bot["unread_count"] = (1 if baseline is None
+                                   else max(1, as_int(row_msgs) - as_int(baseline)))
         else:
             bot["unread_count"] = 0
         if bot["waiting"]:
@@ -859,35 +887,41 @@ def snapshot(root, seen=None, appdata=None, counts=None):
         # "It wrote and you have not looked": its own newest turn, past the last
         # time this bot was opened from the bar. No record at all counts as
         # nothing new - a fresh install must not paint every bot as waiting.
-        wrote_at = float(wrote_ts or 0) if wrote_role == "assistant" else 0.0
-        seen_at = float(seen.get(name) or 0)
+        wrote_at = as_float(wrote_ts) if wrote_role == "assistant" else 0.0
+        seen_at = as_float(seen.get(name))
         unseen = bool(wrote_at and wrote_at > seen_at) if seen_at else False
         # The desktop's own verdict on this bot's chat, which the backend
         # watermark cannot give us: it is the same session id the desktop keys
         # its green dot on. `by_count` is the watermark half of that record, so a
         # chat whose message count has moved past what the desktop last
         # acknowledged is unread even when no explicit marker was written.
-        chat_id = (chat or {}).get("session_id")
-        desktop_says_unread = session_is_unread(read_state, name, chat_id,
-                                                (chat or {}).get("message_count"))
+        # The conversation the bar can actually reach: the newest VISIBLE session,
+        # which is what a click opens. The canonical Bot Chat is hidden and has no
+        # door from the bar - the desktop refuses a deep link into a session that is
+        # not in its loaded list - so measuring unread against it produced a badge
+        # that could never be cleared: clicking opened one session while the count
+        # sat on another. Verified live: a deep link straight into the hidden chat
+        # left its marker in place. Unread is therefore read from this row.
+        unread_id = (recent or {}).get("session_id")
+        unread_msgs = (recent or {}).get("message_count")
+        desktop_says_unread = session_is_unread(read_state, name, unread_id, unread_msgs)
         # The widget's own watermark is a stand-in only where the desktop keeps no
         # record at all. The desktop stamps its OWN watermark every time it shows a
         # session; ours is stamped only by a click on the bar - so trusting it next
         # to a live desktop record leaves a bot marked forever after the user reads
         # the chat in the app window instead.
         fallback_unseen = unseen and not desktop_available
-        waiting = bool(chat["exists"] and (chat.get("unread")
-                                           or desktop_says_unread or fallback_unseen))
-        # The badge's number: messages in this bot's chat since the app last had it
-        # read. `sync_counts()` keeps that baseline level with the desktop's own
+        waiting = bool(unread_id and (desktop_says_unread or fallback_unseen))
+        # The badge's number: messages in that conversation since the app last had
+        # it read. `sync_counts()` keeps the baseline level with the desktop's own
         # verdict, so a chat read in the app window resets it too. With no baseline
         # yet we can still say something is waiting, just not how much - a bare 1
         # beats a fabricated count.
         unread_count = 0
         if waiting:
-            total = int(chat.get("message_count") or 0)
-            baseline = (counts or {}).get(name)
-            unread_count = 1 if baseline is None else max(1, total - int(baseline))
+            baseline = unread_baseline(read_state, name, unread_id, counts)
+            unread_count = (1 if baseline is None
+                            else max(1, as_int(unread_msgs) - as_int(baseline)))
 
         # Roster ordering/activity: newest of (bot created, newest message in any
         # of its sessions) - the desktop's own sortRosterBots().
@@ -1012,9 +1046,52 @@ def load_seen(path):
 
 
 def load_counts(path):
-    """Per bot: the chat's message count as of the last time it read as read."""
+    """Per bot: which conversation the baseline belongs to, and its message count.
+
+    Keyed by session id as well as the bot, because the row a click reaches can
+    change (a bot's newest visible chat is replaced by the next one) and a baseline
+    from the previous conversation would then be subtracted from a different one -
+    which produced a nonsense badge (a count of 587 where one message had arrived).
+    A record without an id is from the older format and is treated as no baseline.
+    """
     counts = _load_seen_payload(path).get("counts")
-    return counts if isinstance(counts, dict) else {}
+    if not isinstance(counts, dict):
+        return {}
+    out = {}
+    for name, value in counts.items():
+        if not isinstance(value, dict) or not isinstance(value.get("id"), str):
+            continue
+        try:
+            count = int(value.get("count") or 0)
+        except (TypeError, ValueError):
+            # A hand-edited or corrupted file must not take the watcher down; a
+            # baseline we cannot read is simply no baseline.
+            continue
+        out[name] = {"id": value["id"], "count": count}
+    return out
+
+
+def count_baseline(counts, name, session_id):
+    """The stored count for this bot IF it was measured on this same session."""
+    entry = (counts or {}).get(name)
+    if not isinstance(entry, dict) or not session_id:
+        return None
+    return entry["count"] if entry.get("id") == session_id else None
+
+
+def unread_baseline(read_state, name, session_id, counts):
+    """How many messages were already seen in this conversation.
+
+    The desktop's own record wins whenever it has one for this session: the app
+    stamps it every time it shows a chat, so it is both authoritative and current.
+    Our own baseline is only a fallback for the case the app keeps no record at all
+    (a machine that never ran it) - and it must be for THIS session, or a count from
+    a previous conversation would be subtracted from a different one.
+    """
+    desktop = ((read_state or {}).get(name) or {}).get("seen") or {}
+    if session_id and session_id in desktop:
+        return as_int(desktop[session_id])
+    return count_baseline(counts, name, session_id)
 
 
 def save_seen(path, seen, counts=None):
@@ -1086,16 +1163,25 @@ def sync_counts(path, snap):
         counts = load_counts(path)
         changed = False
         for bot in snap.get("bots", []):
-            chat = bot.get("chat") or {}
-            if not chat.get("session_id"):
+            # The same conversation the badge is measured against: the row a click
+            # reaches, not the hidden canonical chat. Reading the count from a
+            # different session than `unread_count` uses would make the baseline
+            # meaningless.
+            row = bot.get("recent_session") or {}
+            session_id = row.get("session_id")
+            if not session_id:
                 continue
             name = bot["name"]
-            count = int(chat.get("message_count") or 0)
+            count = as_int(row.get("message_count"))
+            entry = counts.get(name)
             # Seed an unknown bot; re-stamp one we just saw read. A waiting bot with
-            # a baseline keeps it, so the number grows while you are not looking.
-            if name not in counts or not bot.get("waiting"):
-                if counts.get(name) != count:
-                    counts[name] = count
+            # a baseline on THIS session keeps it, so the number grows while you are
+            # not looking. A baseline from another conversation is not kept: it would
+            # be subtracted from a different row.
+            same_session = isinstance(entry, dict) and entry.get("id") == session_id
+            if not same_session or not bot.get("waiting"):
+                if not same_session or entry.get("count") != count:
+                    counts[name] = {"id": session_id, "count": count}
                     changed = True
         if changed:
             # Both writers share one file, so write the other half back untouched.

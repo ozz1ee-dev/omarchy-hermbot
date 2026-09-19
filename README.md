@@ -217,30 +217,29 @@ The snapshot is the widget's whole data source:
 
 Definitions are taken from the desktop's own code, not invented:
 
-- **waiting on you** = the bot's own chat is unread according to Hermes Desktop.
-  The app tracks that in its own store rather than in the session database:
-  `sessions.last_read_at` is written only when a row is explicitly toggled, so on
-  a normal install it is NULL for every session and every bot would read as read.
-  What the app actually draws a green dot from is
+- **waiting on you** = the conversation a click can reach is unread according to
+  Hermes Desktop. Two things had to be true for the badge to behave, and only one of
+  them was:
+
+  *Which conversation.* The app tracks read state in its own store rather than in the
+  session database: `sessions.last_read_at` is written only when a row is explicitly
+  toggled, so on a normal install it is NULL for every session and every bot would
+  read as read. What the app draws a green dot from is
   `hermes.desktop.unreadFinishedSessions` (Electron's localStorage, bucketed per
-  profile and keyed by the durable session id - the same id this widget resolves
-  as the bot's canonical chat), so that is the record the widget reads. A chat
-  read in the app window clears here too. Where the app keeps no record at all - a
-  machine that never ran it - the widget falls back to its own watermark: the
-  bot's own newest turn is newer than the last time that bot was opened from the
-  bar (`~/.local/state/omarchy/hermbot/seen.json`, stamped by `hermbot-open`).
-  It is seeded at the bot's own last turn, so a fresh install announces nothing.
-  The two are never mixed on one record: beside a live desktop record the fallback
-  would leave a bot marked forever after a chat read in the app window.
-- **the badge** = how many messages are waiting in that bot's chat, drawn as a
-  count the way Rakabot draws one. The app's own message-count watermark is not
-  readable - it lands in a compressed LevelDB block and its session ids come back
-  truncated - so the number is the widget's own: the chat's `message_count` minus
-  a baseline kept beside the click record, seeded at first sight and re-stamped on
-  every poll where the chat is not waiting. `max(1, message_count - baseline)`. A
-  bot that is already waiting the first time the widget sees it reads `1`: its
-  real backlog predates any baseline the widget holds, and a larger number would
-  be invented.
+  profile and keyed by the durable session id). But the canonical `Bot Chat` is
+  *hidden*, and the app refuses a deep link into a session that is not in its loaded
+  list - so a badge measured against it could never be cleared: clicking opened one
+  session while the count sat on another. Measured live: a deep link straight into
+  the hidden chat left its marker in place. The widget therefore reads unread from
+  the newest **visible** session, which is exactly what its click opens.
+*Which baseline.* `max(1, message_count - baseline)`, where the baseline is the
+  desktop's own `hermes.desktop.sessionSeenCounts` for that same session whenever it
+  has one - the app stamps it every time it shows a chat, so it is authoritative and
+  current. Where the app keeps no record (a machine that never ran it, or a session
+  it has not listed), the widget falls back to its own baseline kept beside the click
+  record in `seen.json`, and only for the same session id. A bot with no baseline at
+  all reads `1`: its real backlog predates any baseline the widget holds, and a larger
+  number would be invented.
 - **active** = a message in any of the bot's sessions within 90 s (the roster's
   own activity window).
 - **the session under a bot** = the one it is still in (`ended_at` is NULL), and

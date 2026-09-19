@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.2
+
+- **Fixed a badge that could never be cleared, reported from real use.** A bot showed
+  a count that survived every click: the number was measured against the bot's
+  canonical `Bot Chat` while the click opened its most recently active *visible*
+  session - two different conversations, so reading one never cleared the other. The
+  canonical chat is hidden and the desktop refuses a deep link into a session that is
+  not in its loaded list (verified live: a link straight into that chat left its
+  marker in place), so the count sat on a conversation the bar has no door to. The
+  badge is now read from the newest visible session - the same row the click opens.
+- **The baseline is the desktop's own count whenever it has one.** It was assumed
+  unreadable (the record sometimes lands in a compressed LevelDB block), but when a
+  compaction leaves it in a plain one it reads fine, and it is authoritative: the app
+  stamps it every time it shows a chat. It now takes precedence, and the widget's own
+  baseline is the fallback for a machine that never ran the app. Without this a bot
+  whose chat had moved on showed a count of 29 where one message had arrived.
+- **The widget's own baseline is keyed by session id as well as bot.** It was stored
+  per bot, so when the row a click reaches changed, a count from the previous
+  conversation was subtracted from a different one - a nonsense badge (587 where one
+  message had arrived). An older record without an id is read as no baseline.
+- **Nothing on disk can take the watcher down any more.** Every number read from the
+  state file went through a bare `float()`/`int()`, so a truncated, hand-edited or
+  older-format `seen.json` raised and killed the watcher - and with it the widget. One
+  pair of helpers now degrades an unreadable value to "no stamp" / zero instead. Proven
+  by injecting a corrupted state file into a running widget: it survived with no error.
+
 ## 0.4.1
 
 - **Fixed a security review finding: nothing of ours is addressed by a fixed path
