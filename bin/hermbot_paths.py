@@ -20,6 +20,7 @@ Nothing here names a user or an install path: the scripts find each other throug
 __file__, so the plugin works from any directory it is installed into.
 """
 import os
+import stat
 from pathlib import Path
 
 
@@ -78,6 +79,72 @@ def appdata():
 APPDATA = appdata()
 
 
+def open_nofollow(path, flags, mode=0o600):
+    """`os.open` that refuses to follow a symlink at `path`.
+
+    O_NOFOLLOW makes a symlink an error (ELOOP) instead of a door: without it a
+    pre-created link at a predictable name, in a directory somebody else can
+    write to, redirects the open - and a truncating open then destroys whatever it
+    was pointed at. Ownership and type are checked on the opened descriptor, not
+    on the name, so nothing can be swapped underneath between the two.
+    """
+    fd = os.open(path, flags | os.O_NOFOLLOW, mode)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        os.close(fd)
+        raise OSError("refusing %s: not a regular file we own" % path)
+    return fd
+
+
+def _create_exclusive(tmp):
+    """Create a fixed temporary name with O_EXCL, clearing only our own leftover.
+
+    A crashed run can leave the temporary behind, and that one is ours to remove -
+    but anything at that name which is not a regular file we own (a symlink, a
+    directory, somebody else's file) is refused rather than replaced, because that
+    is exactly the shape of the attack this guards against.
+    """
+    for _ in range(2):
+        try:
+            return open_nofollow(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        except FileExistsError:
+            try:
+                info = os.lstat(tmp)
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise OSError("refusing to clear %s: not a regular file we own" % tmp)
+            os.unlink(tmp)
+    raise OSError("could not create %s" % tmp)
+
+
+def atomic_write(path, data, encoding=None):
+    """Replace `path` with `data`, never writing through a pre-made entry.
+
+    A plain write to a fixed temporary name follows whatever already sits there,
+    and in a directory others can write to that is a symlink aimed at any file this
+    account may write - the update then lands on the attacker's target. Creating
+    the temporary with O_EXCL and swapping it in with a rename closes that: an
+    existing name can only be refused or cleared, never followed or reused, and the
+    rename replaces the destination entry itself rather than what it points at.
+    Pass `encoding` for text, or leave it None for bytes.
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = _create_exclusive(tmp)
+    try:
+        kwargs = {} if encoding is None else {"encoding": encoding}
+        with os.fdopen(fd, "wb" if encoding is None else "w", **kwargs) as fh:
+            fh.write(data)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp, path)
+
+
 # The three logs under the state directory (open.log, send.log, notify.log) are
 # written on every open, every send and every notification, and nothing ever reads
 # them back - they exist so a user can see what the widget did. Left alone they
@@ -93,12 +160,15 @@ def append_log(path, line):
     """Append one already-formatted line, trimming the log to its tail past the cap.
 
     Callers own the line format (one of them carries no timestamp), so this only
-    appends and bounds - it never rewrites what a log line looks like.
+    appends and bounds - it never rewrites what a log line looks like. Both halves
+    go through the no-follow helpers: an append is as easy to redirect through a
+    pre-created symlink as a truncating write, and the trim is a replace.
     """
     try:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
+        fd = open_nofollow(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(str(line).rstrip() + "\n")
         if path.stat().st_size <= LOG_CAP_BYTES:
             return
@@ -107,8 +177,6 @@ def append_log(path, line):
         cut = tail.find(b"\n")
         if cut >= 0:
             tail = tail[cut + 1:]
-        tmp = path.with_name(path.name + ".trim")
-        tmp.write_bytes(tail)
-        os.replace(tmp, path)
+        atomic_write(path, tail)
     except (OSError, ValueError):
         pass

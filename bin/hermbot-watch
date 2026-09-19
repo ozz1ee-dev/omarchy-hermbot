@@ -983,9 +983,11 @@ def save_state(path, snap):
             for b in snap["bots"]
         },
     }
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    # A fixed temporary name beside the target is a symlink hazard wherever the
+    # directory is not ours alone: the helper creates it exclusively and swaps it
+    # in with a rename, so a pre-made entry can only be refused, never written
+    # through.
+    hermbot_paths.atomic_write(path, json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
 # ── what you have already looked at ─────────────────────────────────────────
@@ -1023,9 +1025,8 @@ def save_seen(path, seen, counts=None):
     if counts is None:
         counts = load_counts(path)
     payload = {"updated_ts": time.time(), "bots": seen, "counts": counts}
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    hermbot_paths.atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2),
+                               encoding="utf-8")
 
 
 def mark_seen(path, name):
@@ -1228,11 +1229,18 @@ def acquire_state_lock(state_path, attempts=5, delay=0.1):
     A bar widget is frequently instantiated twice, so two watchers can poll the
     same install; without the lock both diff the same snapshot and post the same
     card twice. Returns the held handle, or None when another instance owns it.
+
+    Opened without O_TRUNC and without following a symlink. `open("w")` - the
+    obvious spelling - truncates, so a link planted at the lock's name, in a
+    directory somebody else can write to, turns taking the lock into destroying
+    whatever the link points at. The lock file's contents are never used, and the
+    mode is checked on the descriptor rather than on the name.
     """
     lock_path = Path(str(state_path) + ".lock")
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = lock_path.open("w")
+        fd = hermbot_paths.open_nofollow(lock_path, os.O_RDWR | os.O_CREAT)
+        handle = os.fdopen(fd, "r+")
     except OSError:
         return None
     for _ in range(attempts):
@@ -1352,10 +1360,21 @@ def _remote_payload():
     """Everything the far side needs, as one script to feed to `python3 -`.
 
     The watcher imports its sibling module, so streaming the bare script is not
-    enough any more. The payload unpacks the whole little bundle into one
-    deterministic scratch directory under the remote's /tmp (replaced on every
-    reconnect, so nothing accumulates) and execs the watcher from there - which
-    is also what makes `__file__` and the sibling import resolve.
+    enough any more. The payload unpacks the whole little bundle into a directory
+    created for this connection and execs the watcher from there - which is also
+    what makes `__file__` and the sibling import resolve.
+
+    That directory is created, never taken from a guessable name. `/tmp` is
+    world-writable, so a fixed `hermbot-watch-<uid>` path can be pre-created by
+    another account on a shared host - as a directory it owns, or as a symlink
+    aimed somewhere else entirely - and unpacking into it then writes through
+    entries somebody else controls. So: prefer the session's own runtime directory
+    (private to the account, and cleared when the session ends), fall back to a
+    `mkdtemp` directory with a random name, verify that what we got is a real
+    directory we own and force it to 0700, and keep the watcher's state files
+    inside it as well instead of at fixed `/tmp` names. Only a directory that
+    passed that check is ever pruned, and only of runs old enough to be nobody's
+    live connection.
     """
     import base64
     import io
@@ -1368,19 +1387,59 @@ def _remote_payload():
             tar.add(here / name, arcname=name)
     blob = base64.b64encode(buf.getvalue()).decode("ascii")
     return (
-        "import base64, io, os, pathlib, shutil, sys, tarfile, tempfile\n"
+        "import base64, io, os, pathlib, shutil, stat, sys, tarfile, tempfile, time\n"
         f"blob = {blob!r}\n"
-        "d = os.path.join(tempfile.gettempdir(), 'hermbot-watch-%d' % os.getuid())\n"
-        "shutil.rmtree(d, ignore_errors=True)\n"
-        "os.makedirs(d, exist_ok=True)\n"
+        "uid = os.getuid()\n"
+        "def ours(path):\n"
+        "    try:\n"
+        "        os.mkdir(path, 0o700)\n"
+        "    except FileExistsError:\n"
+        "        pass\n"
+        "    except OSError:\n"
+        "        return None\n"
+        "    try:\n"
+        "        info = os.lstat(path)\n"
+        "    except OSError:\n"
+        "        return None\n"
+        "    if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid:\n"
+        "        return None\n"
+        "    os.chmod(path, 0o700)\n"
+        "    return path\n"
+        "runtime = os.environ.get('XDG_RUNTIME_DIR') or ''\n"
+        "candidates = [os.path.join(runtime, 'hermbot')] if runtime else []\n"
+        "candidates.append(os.path.join(tempfile.gettempdir(), 'hermbot-%d' % uid))\n"
+        "parent = None\n"
+        "for cand in candidates:\n"
+        "    if os.path.islink(cand):\n"
+        "        continue\n"
+        "    parent = ours(cand)\n"
+        "    if parent:\n"
+        "        break\n"
+        "if parent:\n"
+        "    for entry in os.scandir(parent):\n"
+        "        try:\n"
+        "            if time.time() - entry.stat(follow_symlinks=False).st_mtime < 3600:\n"
+        "                continue\n"
+        "            if entry.is_dir(follow_symlinks=False):\n"
+        "                shutil.rmtree(entry.path, ignore_errors=True)\n"
+        "            else:\n"
+        "                os.unlink(entry.path)\n"
+        "        except OSError:\n"
+        "            pass\n"
+        "    work = tempfile.mkdtemp(prefix='run-', dir=parent)\n"
+        "else:\n"
+        "    work = tempfile.mkdtemp(prefix='hermbot-watch-')\n"
         "with tarfile.open(fileobj=io.BytesIO(base64.b64decode(blob))) as tar:\n"
         "    try:\n"
-        "        tar.extractall(d, filter='data')\n"
+        "        tar.extractall(work, filter='data')\n"
         "    except TypeError:\n"
-        "        tar.extractall(d)\n"
-        "w = pathlib.Path(d, 'hermbot-watch')\n"
+        "        tar.extractall(work)\n"
+        "w = pathlib.Path(work, 'hermbot-watch')\n"
         "w.chmod(0o700)\n"
-        "os.execv(sys.executable, [sys.executable, str(w)] + sys.argv[1:])\n"
+        "os.execv(sys.executable, [sys.executable, str(w)] + sys.argv[1:] + [\n"
+        "    '--state', os.path.join(work, 'notify.json'),\n"
+        "    '--seen', os.path.join(work, 'seen.json'),\n"
+        "])\n"
     )
 
 
@@ -1390,16 +1449,16 @@ def ssh_stream(args, target):
     One ssh connection is held open (ControlMaster) and the remote copy runs in
     streaming mode; every line it prints is passed straight through, with the two
     decisions that can only be made on this side re-made here: what you have
-    looked at, and whether a card should be raised. The remote copy keeps its
-    state in /tmp, so it never writes into that machine's own widget state.
+    looked at, and whether a card should be raised. The remote copy keeps its state
+    in its own private scratch directory, so it never writes into that machine's
+    own widget state - and nothing of ours is addressed by a fixed path on a
+    machine we do not own.
     """
     # The root is only worth passing when it was named explicitly: the other
     # machine's home is its own, and /home/<user>/.hermes does not exist there.
     remote_args = ["--interval", str(args.interval)]
     if str(args.hermes_root) != str(DEFAULT_ROOT):
         remote_args += ["--hermes-root", str(args.hermes_root)]
-    remote_args += ["--state", "/tmp/hermbot-remote-notify.json",
-                    "--seen", "/tmp/hermbot-remote-seen.json"]
     script = _remote_payload()
     while True:
         try:

@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.1
+
+- **Fixed a security review finding: nothing of ours is addressed by a fixed path
+  on a machine we do not own.** The ssh source unpacked its bundle into
+  `/tmp/hermbot-watch-<uid>` - a name any other account on a shared host can create
+  first, as a directory it owns or as a symlink pointing anywhere - after removing
+  and recreating that path. It now creates a directory for the connection and
+  verifies what it got: the session's own `XDG_RUNTIME_DIR` when there is one
+  (private to the account, cleared with the session), else a randomly named
+  `mkdtemp` directory, checked to be a real directory the account owns and forced
+  to `0700` before anything is unpacked into it. The remote watcher's state files
+  now live inside that directory instead of at fixed `/tmp` names, and only a
+  directory that passed the check is ever pruned - of runs old enough to be
+  nobody's live connection.
+- **Every write now refuses to follow a symlink and never writes through a
+  pre-made entry.** The state files, the click watermark and the log trims all went
+  through fixed `.tmp` names written with `write_text`, and the lock file was opened
+  with `open("w")` - a truncating open at a predictable name, which a link planted
+  in a writable directory turns into destroying whatever it points at. One helper
+  now creates the temporary with `O_EXCL`, refuses anything at that name that is not
+  a regular file the account owns, and swaps it in with a rename; the lock opens
+  `O_RDWR|O_CREAT` without `O_TRUNC` and without following links; the log append and
+  the message file `hermbot-send` hands to the detached child are opened the same
+  way, the latter through the descriptor `mkstemp` returned rather than by reopening
+  the name.
+- `send.out`, the detached child's output file, is bounded like the other logs -
+  nothing was pruning it either.
+
 ## 0.4.0
 
 - **Bots can finally be seen waiting on you.** The roster used to sit flat because

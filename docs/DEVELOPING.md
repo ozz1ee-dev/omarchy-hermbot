@@ -37,8 +37,9 @@ files as one bundle for exactly this reason).
 the Hermes Desktop install the widget is following - this machine, or the SSH
 host the app is connected to (the watcher streams this same script there over one
 ssh connection and re-emits its JSON lines; nothing is installed on the far side
-and its own state is untouched, because the copy there writes scratch files under
-`/tmp`). Nothing is written to a profile anywhere. What is written locally - this
+and its own state is untouched, because the copy there writes scratch files in a
+private directory it creates and owns). Nothing is written to a profile anywhere.
+What is written locally - this
 machine - lives outside the plugin directory
 (`~/.local/state/omarchy/hermbot/`) so an update cannot resurrect old events:
 the notification state (`notify.json`), the outbox for a detached send

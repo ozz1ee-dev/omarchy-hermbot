@@ -147,8 +147,12 @@ written to a profile and no credential is ever needed. There is no token to
 configure - unlike a hosted chat service, the Hermes roster is already on disk.
 When the desktop is pointed at an SSH host, that host's roster is read the same
 way: the watcher runs this same script there over one ssh connection it holds
-open, and the only thing written on the far side is a scratch directory under
-`/tmp` that the copy there uses for its own state. Set `source` to `local` (or
+open, and the only thing written on the far side is a private scratch directory
+of its own - under that session's `XDG_RUNTIME_DIR` when there is one, else a
+randomly named directory created with `mkdtemp` under `/tmp`. It is verified to be
+a directory the account owns and forced to `0700` before anything is unpacked
+into it, so nothing of ours is ever addressed by a fixed, guessable path on a
+machine we do not own. Set `source` to `local` (or
 press `s`) to pin the bar to this machine regardless.
 
 The three scripts also answer to environment variables, for the cases where a

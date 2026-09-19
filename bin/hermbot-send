@@ -90,13 +90,22 @@ def write_query_file(text):
     It must SURVIVE the spawn: the detached child reads it after we return, so
     an unlink here is a race (the turn dies with "cannot read --query-file").
     Kept under the state dir at 0600 and pruned by the next run instead.
+
+    Written through the descriptor `mkstemp` handed back rather than by reopening
+    the name: the second open could follow a link swapped in at that path between
+    the two calls, and the message would land wherever it pointed.
     """
     handle, name = tempfile.mkstemp(prefix="send-", suffix=".txt", dir=str(query_dir()))
-    os.close(handle)
-    path = Path(name)
-    path.write_text(text, encoding="utf-8")
-    path.chmod(0o600)
-    return path
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except BaseException:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
+    return Path(name)
 
 
 def main(argv=None):
@@ -152,7 +161,17 @@ def main(argv=None):
         # by hermbot-watch, not printed into a bar process that has exited.
         logf = STATE / "send.out"
         STATE.mkdir(parents=True, exist_ok=True)
-        with logf.open("a", encoding="utf-8") as fh:
+        # The child needs a descriptor, not a line, so the shared append helper does
+        # not fit here - but the same two rules do: bound the file before adding to
+        # it (nothing ever prunes this one), and open it without following a link.
+        try:
+            if logf.stat().st_size > hermbot_paths.LOG_CAP_BYTES:
+                hermbot_paths.atomic_write(
+                    logf, logf.read_bytes()[-hermbot_paths.LOG_KEEP_BYTES:])
+        except OSError:
+            pass
+        fd = hermbot_paths.open_nofollow(logf, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
             proc = subprocess.Popen(
                 cmd, stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                 start_new_session=True, env=env, cwd=str(Path.home()),
