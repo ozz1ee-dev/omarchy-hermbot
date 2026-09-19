@@ -20,7 +20,7 @@ import qs.Ui
 // reads the same files the desktop writes and streams them; this renders each bot
 // as its own avatar - the shape and colour it carries in ui_meta - with an
 // expression for its state: alert when it is waiting on you, curious when it has
-// something unread, excited while it is active. Keys: j/k move ·
+// something unread or has spoken recently, excited while it is active. Keys: j/k move ·
 // Enter focus the app · h redact · r cycle the bar text · g group by
 // gateway · Esc close.
 
@@ -111,7 +111,8 @@ Panel {
     var bot = function(name, title, shape, color, unread, waiting, active, mins, text, fromBot) {
       return { name: name, handle: "@" + name, title: title, description: "",
                shape: shape, color: color, image_kind: "shape", custom: true, created: null,
-               gateway_served: true, waiting: waiting, active: active, activity_at: ago(mins),
+               gateway_served: true, waiting: waiting, unread_count: unread,
+               active: active, activity_at: ago(mins),
                chat: { session_id: "demo_" + name, exists: true, hidden: true, pinned: false,
                        archived: false, message_count: 40 + (mins % 90),
                        last_activity_at: ago(mins), last_read_at: null, unread: unread > 0,
@@ -235,14 +236,20 @@ Panel {
   }
 
   // Expression carries state. Gone quiet for a week does say something, so that
-  // is what dozes; a bot in the middle of a conversation is the awake one.
+  // is what dozes.
   readonly property double staleAfterS: 7 * 24 * 3600
   function faceFor(b) {
     var chat = b.chat || ({})
-    if (b.waiting) return "attentive"
-    if (chat.unread && b.active) return "excited"
-    if (chat.unread) return "curious"
-    if (b.active) return "happy"
+    // Same pose Rakabot gives its unread bots. One level, not Rakabot's two: the
+    // count it splits on (`unread > 1` -> excited, exactly one -> curious) has no
+    // reliable source here. The desktop's own message-count watermark sits in a
+    // Snappy-compressed LevelDB block and reads back with truncated session ids,
+    // so that split would be decided on garbage - refusing it is the honest call.
+    if (b.waiting) return "excited"
+    // The desktop's own 90-second activity window, kept as the one deliberate
+    // addition: a bot mid-turn is awake before its answer lands and moves the
+    // count. Rakabot reads a live unread counter and needs no such window.
+    if (b.active) return "curious"
     if (b.activity_at && (nowMs / 1000 - b.activity_at) > staleAfterS) return "drowsy"
     return "neutral"
   }
@@ -987,9 +994,11 @@ Panel {
                 color: root.divider
               }
 
-              // Bots with news get greeted when the panel opens.
+              // Bots with news get greeted when the panel opens - Rakabot's own
+              // line, `unread > 0`. Nothing else waves: the news is what the wave
+              // is about, and this is now driven by real unread state.
               readonly property bool wantsGreeting: modelData.kind === "bot"
-                && (!!modelData.bot.chat && modelData.bot.chat.unread || modelData.bot.waiting)
+                && !!modelData.bot.waiting
 
               Connections {
                 target: root
@@ -1179,7 +1188,15 @@ Panel {
                         textFormat: Text.PlainText
                         text: modelData.kind === "bot"
                           ? root.label(modelData.bot.title || modelData.bot.name) : ""
-                        color: modelData.kind === "bot" && modelData.bot.waiting ? root.urgent : root.fg
+                        // Rakabot's own line is `focused ? accent : fg`, and its
+                        // `focused` is a dead field - both writers set it to False
+                        // and nothing ever raises it - so its names are always the
+                        // foreground. Mirroring the expression means mirroring that
+                        // outcome; tinting a waiting bot here (it used to take
+                        // `urgent`) is what made this roster's names red where the
+                        // sibling's are cream. Weight and the badge already carry
+                        // "this one wants you".
+                        color: root.fg
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.bodySmall
                         font.bold: modelData.kind === "bot"
@@ -1227,7 +1244,13 @@ Panel {
                     }
                     Rectangle {
                       anchors.right: parent.right
-                      visible: modelData.kind === "bot" && !!modelData.bot.chat && modelData.bot.chat.unread
+                      // A count on the bot that is waiting on you - Rakabot's own
+                      // badge - and a dot on the session rows the desktop paints
+                      // green. `chat.unread` alone is never true here: it is the
+                      // backend watermark, which nothing stamps.
+                      visible: modelData.kind === "bot" ? !!modelData.bot.waiting
+                             : (modelData.kind === "attach" || modelData.kind === "pinned")
+                               ? !!(modelData.session || {}).unread : false
                       width: Math.max(Style.space(14), unreadText.implicitWidth + Style.space(6))
                       height: Style.space(14)
                       radius: height / 2
@@ -1236,7 +1259,10 @@ Panel {
                         textFormat: Text.PlainText
                         id: unreadText
                         anchors.centerIn: parent
-                        text: modelData.kind === "bot" ? "\u2022" : ""
+                        // The watcher's count of messages since the app last had
+                        // this chat read, so a wide number widens the pill.
+                        text: modelData.kind === "bot"
+                          ? String(modelData.bot.unread_count || 1) : "\u2022"
                         color: Color.background
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption

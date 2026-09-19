@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.4.0
+
+- **Bots can finally be seen waiting on you.** The roster used to sit flat because
+  it read the backend's read watermark (`sessions.last_read_at`), which nothing
+  stamps on a plain read - on a normal install it is NULL for every session, so
+  every bot read as read. Hermes Desktop tracks the same thing in its own store,
+  and the watcher now reads that record: the app's `unreadFinishedSessions`
+  markers, keyed by the durable session id and bucketed per profile, which is
+  exactly the canonical chat the widget already resolves. A chat the app shows
+  unread now wears the excited face and a badge. The app's store stays the
+  authority - a chat read in its window clears here too, which a click-only
+  watermark never did.
+- **The unread badge shows a count, not a dot.** Rakabot draws a number there and
+  this widget drew a bullet; it now carries the number of messages waiting in that
+  bot's chat. The desktop's own message-count watermark is not readable (it lands
+  in a Snappy-compressed LevelDB block, so its session ids come back truncated),
+  so the count is the widget's own: a per-bot baseline kept beside the click
+  record, seeded at first sight and re-stamped on every poll where the chat is not
+  waiting. `max(1, message_count - baseline)`. A bot that is already waiting the
+  first time the widget sees it reads `1` - its real backlog predates any baseline
+  we hold, and a larger number would be invented.
+- **The bot name no longer takes the urgent colour.** Rakabot's own name line is
+  `focused ? accent : fg`, and its `focused` is a dead field - both writers set it
+  to False and nothing ever raises it - so its names are always the foreground.
+  This widget tinted a waiting bot's name `urgent`, which is what made the two
+  rosters look different despite identical type. Measured, not eyeballed: the same
+  name renders 13x90 px at the same coordinates in both panels, so the type was
+  already 1:1 and only the colour was not. Weight and the badge still carry "this
+  one wants you".
+- **Removed the freshness window (`freshAfterS`).** It existed to keep the roster
+  from sitting flat while the host's unread was unreachable, and it was a
+  deviation - Rakabot has no such window, and it altered 0 bots' faces once the
+  waiting branch came first. The host's own 90-second `active` window is the one
+  deliberate addition that stays.
+- The widget's own click watermark is now a fallback, used only where the desktop
+  keeps no record at all (a machine that never ran the app). Beside a live desktop
+  record it left a bot marked forever after a chat read in the app window.
+- The three state logs (`open.log`, `send.log`, `notify.log`) are bounded: each
+  keeps its last 128 KB once it passes 256 KB. They were append-only, on files
+  nothing prunes.
+- The ssh source closes its child's pipes before each reconnect instead of leaving
+  the descriptors to the interpreter's collector.
+
 ## 0.3.7
 
 - The same hole, one line further down: the pinned-agent header read `.title`

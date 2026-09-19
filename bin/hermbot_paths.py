@@ -76,3 +76,39 @@ def appdata():
 
 
 APPDATA = appdata()
+
+
+# The three logs under the state directory (open.log, send.log, notify.log) are
+# written on every open, every send and every notification, and nothing ever reads
+# them back - they exist so a user can see what the widget did. Left alone they
+# grow for as long as the bar runs, on a file nobody prunes. So they are capped:
+# past LOG_CAP the file keeps only its last LOG_KEEP_BYTES, trimmed to a line
+# boundary. That preserves the recent history (the part anyone actually looks at)
+# and bounds the file. A failure here is never worth taking a caller down for.
+LOG_CAP_BYTES = 256 * 1024
+LOG_KEEP_BYTES = 128 * 1024
+
+
+def append_log(path, line):
+    """Append one already-formatted line, trimming the log to its tail past the cap.
+
+    Callers own the line format (one of them carries no timestamp), so this only
+    appends and bounds - it never rewrites what a log line looks like.
+    """
+    try:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(str(line).rstrip() + "\n")
+        if path.stat().st_size <= LOG_CAP_BYTES:
+            return
+        tail = path.read_bytes()[-LOG_KEEP_BYTES:]
+        # Never start on a half-written line left by the trim itself.
+        cut = tail.find(b"\n")
+        if cut >= 0:
+            tail = tail[cut + 1:]
+        tmp = path.with_name(path.name + ".trim")
+        tmp.write_bytes(tail)
+        os.replace(tmp, path)
+    except (OSError, ValueError):
+        pass

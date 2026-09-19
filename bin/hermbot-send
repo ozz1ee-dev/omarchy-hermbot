@@ -34,12 +34,8 @@ BOT_CHAT = "Bot Chat"
 
 
 def log(line):
-    try:
-        STATE.mkdir(parents=True, exist_ok=True)
-        with SEND_LOG.open("a", encoding="utf-8") as fh:
-            fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line.rstrip()}\n")
-    except OSError:
-        pass
+    # Timestamped like it always was; the shared helper only bounds the file.
+    hermbot_paths.append_log(SEND_LOG, f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line.rstrip()}")
 
 
 def resolve(name):

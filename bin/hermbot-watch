@@ -346,6 +346,159 @@ def preview_sender(preview):
     return "@" + name
 
 
+def desktop_read_state(appdata=None):
+    """Hermes Desktop's own record of what you have read, per profile.
+
+    The desktop tracks read state in TWO places, and neither of them is the
+    session store the widget reads. `sessions.last_read_at` (the backend
+    watermark) is written only when a row is explicitly toggled - merely reading
+    a chat never stamps it, so on a normal install it stays NULL for every
+    session and reads as "read". The green dot you actually see is kept in the
+    renderer instead:
+
+        hermes.desktop.unreadFinishedSessions   profile -> [durable session ids]
+        hermes.desktop.sessionSeenCounts        profile -> {id: message_count}
+
+    The two mean different things and must not be merged: the first lists the
+    chats that ARE unread, the second lists the ones you HAVE read (as the
+    message count you saw), and a chat is unread when its count has since moved
+    past that. Treating the second as another unread list would paint every chat
+    you have ever opened as waiting on you.
+
+    Both live in Electron's localStorage, i.e. a Chromium LevelDB under the app's
+    own state directory. The keys are plain strings and the values are plain
+    JSON, so the records are readable without a LevelDB client - the table files
+    are scanned for the key and the object that follows it is decoded. A missing,
+    locked or rewritten store yields {} rather than an error: this is a bonus
+    signal, and the widget must keep working without it.
+
+    Returns ({profile: {"marked": set(ids), "seen": {id: count}}}, available),
+    where `available` says whether the desktop's store could be read at all. The
+    caller needs that distinction: a store that exists is authoritative, and the
+    widget's own watermark is only a stand-in for one that does not.
+    """
+    base = Path(appdata) if appdata else APPDATA
+    out = {}
+    found = False
+    root = base / "Local Storage" / "leveldb"
+    if not root.is_dir():
+        return out, False
+    try:
+        files = sorted((p for p in root.iterdir() if p.is_file()),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return out, False
+    for path in files:
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        if b"unreadFinishedSessions" in raw:
+            for value in _json_values_after(raw, "unreadFinishedSessions"):
+                found = True
+                _merge_marked(out, value)
+        if b"sessionSeenCounts" in raw:
+            for value in _json_values_after(raw, "sessionSeenCounts"):
+                found = True
+                _merge_seen(out, value)
+    return out, found
+
+
+def _state_for(out, profile):
+    bucket = out.get(profile)
+    if bucket is None:
+        bucket = out[profile] = {"marked": set(), "seen": {}}
+    return bucket
+
+
+def _merge_marked(out, value):
+    """unreadFinishedSessions: {profile: [session id, ...]} - explicitly unread."""
+    if not isinstance(value, dict):
+        return
+    for profile, ids in value.items():
+        if not isinstance(profile, str):
+            continue
+        bucket = _state_for(out, profile)
+        if isinstance(ids, list):
+            bucket["marked"].update(i for i in ids if isinstance(i, str))
+        elif isinstance(ids, dict):
+            bucket["marked"].update(k for k in ids if isinstance(k, str))
+
+
+def _merge_seen(out, value):
+    """sessionSeenCounts: {profile: {session id: message_count}} - read, as seen."""
+    if not isinstance(value, dict):
+        return
+    for profile, counts in value.items():
+        if not isinstance(profile, str) or not isinstance(counts, dict):
+            continue
+        bucket = _state_for(out, profile)
+        for sid, count in counts.items():
+            if not isinstance(sid, str):
+                continue
+            try:
+                n = int(count)
+            except (TypeError, ValueError):
+                bucket["seen"].setdefault(sid, 0)
+                continue
+            # A higher watermark never goes backwards for a given id.
+            if n > bucket["seen"].get(sid, -1):
+                bucket["seen"][sid] = n
+
+
+def session_is_unread(state, profile, session_id, message_count):
+    """Is one session unread by the desktop's own record?
+
+    Explicitly marked wins; otherwise the chat is unread once its message count
+    has moved past the count the desktop last acknowledged seeing.
+    """
+    bucket = (state or {}).get(profile)
+    if not bucket or not session_id:
+        return False
+    if session_id in bucket["marked"]:
+        return True
+    baseline = bucket["seen"].get(session_id)
+    if baseline is None:
+        return False
+    try:
+        return int(message_count or 0) > int(baseline)
+    except (TypeError, ValueError):
+        return False
+
+
+def _json_values_after(raw, key):
+    """Decode every JSON object that directly follows `key` in a LevelDB file.
+
+    A value can appear more than once (the current table, a compaction's log);
+    callers merge them, and a newer record winning is not required - an id that
+    appears in any record is one the desktop considers unread.
+    """
+    needle = key.encode()
+    idx = 0
+    while True:
+        at = raw.find(needle, idx)
+        if at < 0:
+            return
+        start = raw.find(b"{", at)
+        if start < 0 or start - at > 400:
+            idx = at + 1
+            continue
+        depth = 0
+        for pos in range(start, len(raw)):
+            char = raw[pos:pos + 1]
+            if char == b"{":
+                depth += 1
+            elif char == b"}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        yield json.loads(raw[start:pos + 1].decode("utf-8", "replace"))
+                    except ValueError:
+                        pass
+                    break
+        idx = at + 1
+
+
 def canonical_chat(con, profile_name):
     """The one chat that identifies a bot: the session titled exactly "Bot Chat".
 
@@ -433,7 +586,7 @@ def latest_message(con, session_id):
     return ("", None, None)
 
 
-def attach_session(con):
+def attach_session(con, read_state=None, profile=None):
     """The session to hang off a bot's row, and how it is labelled.
 
     Rule (the owner's): the session still open for this bot, or - when there is
@@ -457,11 +610,11 @@ def attach_session(con):
         except sqlite3.Error:
             row = None
         if row:
-            return session_row(con, row), mode
+            return session_row(con, row, read_state, profile), mode
     return None, None
 
 
-def pinned_sessions(con, limit=12):
+def pinned_sessions(con, limit=12, read_state=None, profile=None):
     """This profile's pinned chats, newest first.
 
     Exactly the desktop's own Pinned section: `pinned = 1`, still visible, and
@@ -478,10 +631,10 @@ def pinned_sessions(con, limit=12):
         ).fetchall()
     except sqlite3.Error:
         return []
-    return [session_row(con, row) for row in rows]
+    return [session_row(con, row, read_state, profile) for row in rows]
 
 
-def session_row(con, row):
+def session_row(con, row, read_state=None, profile=None):
     """One session as the widget shows it.
 
     A title is not always usable - the desktop writes the literal string "None"
@@ -499,6 +652,8 @@ def session_row(con, row):
         "last_activity_at": float(activity or 0),
         "ended": ended_at is not None,
         "message_count": count or 0,
+        # The desktop's own verdict: this is the row the green dot hangs off.
+        "unread": session_is_unread(read_state, profile, sid, count),
         "deep_link": f"hermes://open/{sid}",
     }
 
@@ -607,7 +762,7 @@ def ssh_argv(target, remote_args):
     return argv
 
 
-def apply_local_waiting(snap, seen):
+def apply_local_waiting(snap, seen, appdata=None, counts=None):
     """Re-apply the widget's own "wrote and you have not looked" rule.
 
     The remote side of a stream computes waiting from ITS state directory, which
@@ -616,12 +771,31 @@ def apply_local_waiting(snap, seen):
     """
     if not isinstance(snap, dict) or not snap.get("bots"):
         return snap
+    read_state, desktop_available = desktop_read_state(appdata)
     waiting = 0
     for bot in snap["bots"]:
         wrote = float(bot.get("wrote_at") or 0)
         seen_at = float(seen.get(bot.get("name")) or 0)
         unseen = bool(wrote and written_after(wrote, seen_at))
-        bot["waiting"] = bool((bot.get("chat") or {}).get("unread") or unseen)
+        chat = bot.get("chat") or {}
+        chat_id = chat.get("session_id")
+        chat_msgs = chat.get("message_count")
+        # The desktop's green dot, which is per profile and therefore applies to
+        # a bot on a remote instance too - it is the same profile name the app
+        # keys its own record on.
+        marked = session_is_unread(read_state, bot.get("name"), chat_id, chat_msgs)
+        if marked:
+            bot["desktop_unread"] = True
+        # The desktop record exists only on the machine showing the bar, so the
+        # fallback is decided here rather than on the remote.
+        fallback = unseen and not desktop_available
+        bot["waiting"] = bool(chat.get("exists") and (chat.get("unread") or marked or fallback))
+        if bot["waiting"]:
+            total = int(chat.get("message_count") or 0)
+            baseline = (counts or {}).get(bot.get("name"))
+            bot["unread_count"] = 1 if baseline is None else max(1, total - int(baseline))
+        else:
+            bot["unread_count"] = 0
         if bot["waiting"]:
             waiting += 1
     if isinstance(snap.get("counts"), dict):
@@ -633,7 +807,7 @@ def written_after(wrote, seen_at):
     return bool(seen_at) and wrote > seen_at
 
 
-def snapshot(root, seen=None):
+def snapshot(root, seen=None, appdata=None, counts=None):
     """One roster snapshot.
 
     `seen` maps bot name -> when that bot's chat was last opened from the bar;
@@ -650,6 +824,10 @@ def snapshot(root, seen=None):
                 "gateway": gateway_status(root), "bots": [], "counts": {}}
     gw = gateway_status(root)
     served = set(gw["profiles"])
+    # The desktop's own read record (localStorage), keyed by profile. This is the
+    # green dot the user actually sees: the backend watermark is never stamped by
+    # merely reading, so without this every row reads as read.
+    read_state, desktop_available = desktop_read_state(appdata)
     bots = []
     for name, home_path in bot_homes(root):
         con = open_store(home_path)
@@ -660,8 +838,8 @@ def snapshot(root, seen=None):
             recent = recent_visible_session(con)
             # The row under the bot's own: the session it is in, else the last
             # one it finished, plus that profile's pinned chats.
-            attach, attach_mode = attach_session(con)
-            pinned = pinned_sessions(con)
+            attach, attach_mode = attach_session(con, read_state, name)
+            pinned = pinned_sessions(con, read_state=read_state, profile=name)
             # What the bot itself said last: only its own turn is something to
             # come back to.
             if con is not None and chat and chat.get("session_id"):
@@ -684,6 +862,32 @@ def snapshot(root, seen=None):
         wrote_at = float(wrote_ts or 0) if wrote_role == "assistant" else 0.0
         seen_at = float(seen.get(name) or 0)
         unseen = bool(wrote_at and wrote_at > seen_at) if seen_at else False
+        # The desktop's own verdict on this bot's chat, which the backend
+        # watermark cannot give us: it is the same session id the desktop keys
+        # its green dot on. `by_count` is the watermark half of that record, so a
+        # chat whose message count has moved past what the desktop last
+        # acknowledged is unread even when no explicit marker was written.
+        chat_id = (chat or {}).get("session_id")
+        desktop_says_unread = session_is_unread(read_state, name, chat_id,
+                                                (chat or {}).get("message_count"))
+        # The widget's own watermark is a stand-in only where the desktop keeps no
+        # record at all. The desktop stamps its OWN watermark every time it shows a
+        # session; ours is stamped only by a click on the bar - so trusting it next
+        # to a live desktop record leaves a bot marked forever after the user reads
+        # the chat in the app window instead.
+        fallback_unseen = unseen and not desktop_available
+        waiting = bool(chat["exists"] and (chat.get("unread")
+                                           or desktop_says_unread or fallback_unseen))
+        # The badge's number: messages in this bot's chat since the app last had it
+        # read. `sync_counts()` keeps that baseline level with the desktop's own
+        # verdict, so a chat read in the app window resets it too. With no baseline
+        # yet we can still say something is waiting, just not how much - a bare 1
+        # beats a fabricated count.
+        unread_count = 0
+        if waiting:
+            total = int(chat.get("message_count") or 0)
+            baseline = (counts or {}).get(name)
+            unread_count = 1 if baseline is None else max(1, total - int(baseline))
 
         # Roster ordering/activity: newest of (bot created, newest message in any
         # of its sessions) - the desktop's own sortRosterBots().
@@ -693,10 +897,12 @@ def snapshot(root, seen=None):
             {
                 "gateway_served": name in served,
                 "chat": chat,
-                "waiting": bool(chat["exists"] and (chat["unread"] or unseen)),
+                "waiting": waiting,
+                "unread_count": unread_count,
                 # Machine-readable trail of that same rule.
                 "wrote_at": wrote_at,
                 "seen_at": seen_at,
+                "desktop_unread": desktop_says_unread,
                 "active": bool(newest_ts and (now - newest_ts) < ACTIVE_WINDOW_S),
                 "activity_at": activity,
                 "newest_session_id": newest_sid,
@@ -790,19 +996,33 @@ def save_state(path, snap):
 # bot's own newest turn. Kept beside the notification state, in the same shape.
 
 
-def load_seen(path):
+def _load_seen_payload(path):
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    bots = data.get("bots")
+    return data if isinstance(data, dict) else {}
+
+
+def load_seen(path):
+    bots = _load_seen_payload(path).get("bots")
     return bots if isinstance(bots, dict) else {}
 
 
-def save_seen(path, seen):
+def load_counts(path):
+    """Per bot: the chat's message count as of the last time it read as read."""
+    counts = _load_seen_payload(path).get("counts")
+    return counts if isinstance(counts, dict) else {}
+
+
+def save_seen(path, seen, counts=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"updated_ts": time.time(), "bots": seen}
+    # A caller that only knows about the click record must not drop the other
+    # half: two records, two writers, one file.
+    if counts is None:
+        counts = load_counts(path)
+    payload = {"updated_ts": time.time(), "bots": seen, "counts": counts}
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, path)
@@ -840,6 +1060,46 @@ def seed_seen(path, snap):
         if changed:
             save_seen(path, seen)
         return seen
+    finally:
+        release_state_lock(handle)
+
+
+def sync_counts(path, snap):
+    """Keep the badge's baseline honest: seed it, then re-stamp it on every read.
+
+    The badge counts "messages in this chat since it last read as read". Two things
+    keep that number truthful:
+
+    * a bot with no baseline gets one at first sight, so the count starts at one
+      and grows with each new message rather than pinning at one forever;
+    * a chat that is NOT waiting has been read, so its baseline is re-stamped at
+      the current message count on every poll.
+
+    The second is what survives a chat read in the app window, where this widget's
+    own click record is never touched. The price of the first is that a bot which
+    is *already* waiting when the widget first sees it shows "1" - its real backlog
+    predates the only clock we have, and inventing that number would be a guess.
+    """
+    handle = acquire_state_lock(path)
+    try:
+        counts = load_counts(path)
+        changed = False
+        for bot in snap.get("bots", []):
+            chat = bot.get("chat") or {}
+            if not chat.get("session_id"):
+                continue
+            name = bot["name"]
+            count = int(chat.get("message_count") or 0)
+            # Seed an unknown bot; re-stamp one we just saw read. A waiting bot with
+            # a baseline keeps it, so the number grows while you are not looking.
+            if name not in counts or not bot.get("waiting"):
+                if counts.get(name) != count:
+                    counts[name] = count
+                    changed = True
+        if changed:
+            # Both writers share one file, so write the other half back untouched.
+            save_seen(path, load_seen(path), counts)
+        return counts
     finally:
         release_state_lock(handle)
 
@@ -912,13 +1172,10 @@ def icon_arg():
 
 
 def notify_log(line):
-    try:
-        path = Path(DEFAULT_STATE).parent / "notify.log"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line.rstrip()}\n")
-    except OSError:
-        pass
+    """One line per notification attempt. A debugging aid nobody rewrites, so the
+    shared helper bounds it - see hermbot_paths.append_log."""
+    hermbot_paths.append_log(Path(DEFAULT_STATE).parent / "notify.log",
+                             f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line.rstrip()}")
 
 
 def replace_id(name):
@@ -1174,8 +1431,11 @@ def ssh_stream(args, target):
                 snap = json.loads(line)
             except ValueError:
                 continue
-            snap = apply_local_waiting(stamp(snap, "ssh", target), seen)
+            snap = apply_local_waiting(stamp(snap, "ssh", target), seen, args.appdata,
+                                       load_counts(args.seen))
             settle(args, snap)
+            if not args.once:
+                sync_counts(args.seen, snap)
             emit(snap, args.pretty)
             if args.once:
                 proc.terminate()
@@ -1193,6 +1453,15 @@ def ssh_stream(args, target):
             proc.wait(timeout=5)
         except subprocess.SubprocessError:
             proc.kill()
+        # Close the pipes before the next reconnect. Dropping the reference alone
+        # leaves the descriptors to the interpreter's GC, and a link that flaps
+        # faster than it collects is how an ssh reconnector leaks file handles.
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except OSError:
+                pass
         notify_log(f"source ssh:{target.get('id')}: stream ended ({detail[:160]!r})")
         emit(stamp({"generated_ts": time.time(),
                     "error": f"{_source_label(target)} unreachable",
@@ -1208,7 +1477,8 @@ def local_stream(args, kind, target):
     root = Path(args.hermes_root).expanduser()
     while True:
         try:
-            snap = stamp(snapshot(root, load_seen(args.seen)), kind, target)
+            snap = stamp(snapshot(root, load_seen(args.seen), args.appdata,
+                                  load_counts(args.seen)), kind, target)
         except Exception as exc:  # never take the bar down with us
             err = {"generated_ts": time.time(), "error": "this device unreadable",
                    "error_detail": f"{type(exc).__name__}: {exc}",
@@ -1223,6 +1493,7 @@ def local_stream(args, kind, target):
             # Only the streaming watcher seeds: --once is a read-only query used
             # by the opener, and it must not write state as a side effect.
             seed_seen(args.seen, snap)
+            sync_counts(args.seen, snap)
         emit(snap, args.pretty)
         if args.once:
             return 0

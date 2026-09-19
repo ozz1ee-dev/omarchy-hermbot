@@ -42,9 +42,11 @@ and its own state is untouched, because the copy there writes scratch files unde
 machine - lives outside the plugin directory
 (`~/.local/state/omarchy/hermbot/`) so an update cannot resurrect old events:
 the notification state (`notify.json`), the outbox for a detached send
-(`sends/`), and the "you looked at it" watermark (`seen.json`) that
-`hermbot-open` stamps and `hermbot-watch` compares against each bot's own newest
-turn. If a change here would write into a profile, it is the wrong change.
+(`sends/`), the three bounded debug logs (`open.log`, `send.log`, `notify.log`),
+and `seen.json` - the "you looked at it" watermark `hermbot-open` stamps and
+`hermbot-watch` compares against each bot's own newest turn, plus, beside it, the
+message-count baseline the unread badge counts from. If a change here would write
+into a profile, it is the wrong change.
 
 ## Layout
 

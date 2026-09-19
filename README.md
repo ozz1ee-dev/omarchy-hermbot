@@ -20,8 +20,8 @@ The bar entry, on its own:
 
 ![The bots that want you beside the mark](assets/bar.png)
 
-The faces are the bots that want you: waiting on an answer, active right now, or
-with something unread. When none of them does, the mark stands alone.
+The faces are the bots that want you: unread in Hermes Desktop, or working right
+now. When none of them does, the mark stands alone.
 
 Built and running on a live install: bar faces in each bot's own shape and
 colour, the "waiting on you" count in the panel, notification cards on a bot
@@ -194,7 +194,7 @@ The snapshot is the widget's whole data source:
 
 ```json
 {
- "counts": {"bots": 3, "waiting": 0, "active": 1, "no_chat": 0},
+ "counts": {"bots": 3, "waiting": 1, "active": 1, "no_chat": 0, "pinned": 6},
  "gateway": {"pid": 3748184, "running": true, "profiles": ["default", "dev", "web"]},
  "bots": [{
   "name": "dev", "handle": "@dev", "title": "Dev - Local",
@@ -203,7 +203,8 @@ The snapshot is the widget's whole data source:
        "unread": false, "message_count": 200, "preview": "...",
        "preview_role": "assistant", "from_bot": null},
   "recent_session": {"session_id": "20260918_145557_e98322", "title": "..."},
-  "active": true, "waiting": false,
+  "active": true, "waiting": true, "unread_count": 3,
+  "desktop_unread": true, "wrote_at": 1789748368.0, "seen_at": 1789751582.0,
   "open": {"deep_link": "hermes://open/<bot-chat>?profile=dev",
        "recent_deep_link": "hermes://open/<recent>?profile=dev"}
  }]
@@ -212,17 +213,30 @@ The snapshot is the widget's whole data source:
 
 Definitions are taken from the desktop's own code, not invented:
 
-- **waiting on you** = the backend watermark, OR the one this widget keeps
-  itself. The backend half: `last_read_at` NULL means *read*, `0` means
-  *unread*, otherwise unread when activity postdates it
-  (`SessionDB.session_unread`); verified A/B against that function, identical on
-  all six watermark cases, both edge values included. The widget's half: the
+- **waiting on you** = the bot's own chat is unread according to Hermes Desktop.
+  The app tracks that in its own store rather than in the session database:
+  `sessions.last_read_at` is written only when a row is explicitly toggled, so on
+  a normal install it is NULL for every session and every bot would read as read.
+  What the app actually draws a green dot from is
+  `hermes.desktop.unreadFinishedSessions` (Electron's localStorage, bucketed per
+  profile and keyed by the durable session id - the same id this widget resolves
+  as the bot's canonical chat), so that is the record the widget reads. A chat
+  read in the app window clears here too. Where the app keeps no record at all - a
+  machine that never ran it - the widget falls back to its own watermark: the
   bot's own newest turn is newer than the last time that bot was opened from the
   bar (`~/.local/state/omarchy/hermbot/seen.json`, stamped by `hermbot-open`).
-  It exists because the desktop never writes its watermark while you merely
-  read, so on the backend rule alone the roster would sit still forever - and
-  the avatars only animate on state changes. A bot with no record is seeded at
-  its own last turn, so a fresh install announces nothing.
+  It is seeded at the bot's own last turn, so a fresh install announces nothing.
+  The two are never mixed on one record: beside a live desktop record the fallback
+  would leave a bot marked forever after a chat read in the app window.
+- **the badge** = how many messages are waiting in that bot's chat, drawn as a
+  count the way Rakabot draws one. The app's own message-count watermark is not
+  readable - it lands in a compressed LevelDB block and its session ids come back
+  truncated - so the number is the widget's own: the chat's `message_count` minus
+  a baseline kept beside the click record, seeded at first sight and re-stamped on
+  every poll where the chat is not waiting. `max(1, message_count - baseline)`. A
+  bot that is already waiting the first time the widget sees it reads `1`: its
+  real backlog predates any baseline the widget holds, and a larger number would
+  be invented.
 - **active** = a message in any of the bot's sessions within 90 s (the roster's
   own activity window).
 - **the session under a bot** = the one it is still in (`ended_at` is NULL), and
@@ -323,9 +337,7 @@ branch rather than a release.
 2. Flip the click to the **canonical Bot Chat** the day `hermes://bot/<profile>`
    ships in a released desktop (`HERMBOT_DESKTOP_BIN` already lets the door be
    tested against a build from a branch).
-3. Unread as a count rather than a marker, once the store exposes one - Hermes
-   reports `unread` as a boolean today.
-4. Marketplace submission.
+3. Marketplace submission.
 
 ## Development
 

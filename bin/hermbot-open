@@ -35,12 +35,8 @@ LOG = hermbot_paths.STATE_DIR / "open.log"
 
 
 def log(line):
-    try:
-        LOG.parent.mkdir(parents=True, exist_ok=True)
-        with LOG.open("a", encoding="utf-8") as fh:
-            fh.write(line.rstrip() + "\n")
-    except OSError:
-        pass
+    # Bounded by the shared helper; this log carries no timestamp by design.
+    hermbot_paths.append_log(LOG, line)
 
 
 def electron_binary():
