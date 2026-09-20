@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.5.0
+
+- **You can talk to a bot from the panel now, with Hermes Desktop not involved.**
+  A bot row opens a chat window in place of the roster: `n` starts a fresh chat with
+  the bot under the cursor, `Esc` goes back, and the header names the bot being
+  talked to. The turn is handed to Hermes exactly as the desktop hands it over -
+  `@file:` and `@image:` references in the message, the text through `--query-file`,
+  every process spawned as argv - so nothing is re-implemented on this side and no
+  shell is involved anywhere.
+- **The bot's work is in the stream, live while the turn runs.** Thinking blocks, one
+  line per tool call and one per result, errors included. The answer lands in one
+  piece several seconds after you send, so without this the wait is a spinner; with
+  it the call that produced the answer appears as it happens, and the same detail is
+  read back from the session store afterwards. `w`, or the header's `stream on` /
+  `stream off`, folds it back to a plain conversation, saved.
+- **Attach files, with a real preview.** `+` opens a file browser *inside the panel*
+  and what you pick becomes a chip above the input, with a thumbnail when it is an
+  image. In-panel on purpose: the panel is a full-screen surface on the overlay
+  layer, so a separate chooser can only ever appear underneath it and takes focus
+  with it.
+- **A bot row talks in the bot's own canonical Bot Chat.** Hermes allows one writer
+  per session, and the desktop holds that lease while a chat is open in it. The row
+  therefore targets the conversation the desktop keeps out of its sidebar - the one
+  nothing else holds - and a session row that does target a desktop-held chat says
+  so in the window instead of failing on a refusal.
+- **Demo mode stages the conversation as well as the roster.** The demo sessions are
+  in no store, so reading one returned nothing and the chat window showed an empty
+  conversation - useless as a demo and useless for a screenshot. It now fills the
+  window with a staged turn, and the read error that used to sit under the input box
+  is suppressed while demo mode is on.
+- **Fixed: the panel's keys stopped answering after leaving the chat window.** The
+  chat's input held the keyboard focus, and going back to the roster left it on an
+  item that was by then hidden, so `n`, `r`, `p` and `s` all did nothing - with no
+  error in the log to say why. Focus now returns to the panel's key catcher when the
+  chat closes. Measured with synthetic key presses: from a clean roster both worked;
+  after leaving a chat, both were dead.
+- **Fixed: `stream off` still showed the work while the turn ran.** The switch cut
+  the work out of the store read but not out of the live stream, so turning it off
+  meant "visible while it runs, gone the moment it ends" - which reads as a glitch,
+  not a setting. Both views obey the same switch now.
+- **The footer is two lines, and no longer advertises a key that does nothing.** The
+  list of keys had outgrown the card and could only ever be elided; it is split by
+  role now - what you press to act, then what the panel is currently set to, so the
+  second line doubles as a readout of the order, the source and the bar metric. `h`
+  was listed there and had no handler anywhere in the file, while `o` worked and was
+  not listed at all. The space under the footer was measured at more than twice the
+  space above the header and is now near-symmetric.
+- **`showWork` became a setting, and the chat window gained probes.** Seven settings
+  now. `chatState`, `newChat`, `closeChat`, `openThread`, `picker` and `attach` join
+  the IPC surface, because the chat window is otherwise reachable only by clicking -
+  which is also how the screenshots in the README were taken.
+- **The README was brought back in line with the code.** It still claimed the panel
+  had no input, listed a key with no handler, counted six settings, and described a
+  footer that shortens as the panel narrows. None of that is true any more, and a
+  description that disagrees with the code is worse than no description.
+
 ## 0.4.2
 
 - **Fixed a badge that could never be cleared, reported from real use.** A bot showed

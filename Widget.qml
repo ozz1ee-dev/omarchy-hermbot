@@ -64,6 +64,7 @@ Panel {
   readonly property int maxBarAvatars: Math.max(1, Math.min(6, Number(setting("maxBarAvatars", 3))))
   readonly property string watcher: Qt.resolvedUrl("bin/hermbot-watch").toString().replace(/^file:\/\//, "")
   readonly property string opener: Qt.resolvedUrl("bin/hermbot-open").toString().replace(/^file:\/\//, "")
+  readonly property string sender: Qt.resolvedUrl("bin/hermbot-send").toString().replace(/^file:\/\//, "")
 
   // Notifications when a bot writes or starts waiting for you. These belong to the
   // watcher: it is the only thing that sees a transition, and it owns the state
@@ -78,6 +79,329 @@ Panel {
   // bar holds the roster of whatever the app is on - this machine, or the SSH
   // host it is pointed at. "local" pins it to this machine.
   property string source: String(setting("source", "auto"))
+
+  // ---- the chat window ------------------------------------------------------
+  // A row opens its conversation here instead of handing it to the desktop, so
+  // the bar can be the whole surface. `chat` is the thread being read (null = the
+  // roster is showing); the turns, the live tail and the pending flag are separate
+  // properties so a streaming reply can be appended without rebuilding history.
+  property var chat: null
+  property var chatTurns: []
+  property string chatLive: ""
+  property bool chatPending: false
+  property string chatError: ""
+  property bool chatLoading: false
+  // Which instance the open chat belongs to. Captured when it opens: the source
+  // can be switched while a window is up, and the thread must keep being read and
+  // written on the machine it was opened from.
+  property string chatSource: "auto"
+  // Files queued for the next turn: { path, name, image }
+  property var chatAttach: []
+
+  // The in-panel file browser: whether it is open, where it is, and what is there.
+  property bool pickerOpen: false
+  property string pickerDir: ""
+  property string pickerParent: ""
+  property var pickerEntries: []
+  property string pickerError: ""
+
+  // Whether the transcript also shows HOW the bot got there - its thinking, every
+  // call it made, what came back. On by default because watching the work is the
+  // point of having the window; `w` turns it off for a plain conversation.
+  property bool showWork: String(setting("showWork", "true")) !== "false"
+  // `n` starts a chat with the bot under the cursor, so the footer has to name that
+  // bot - otherwise the key silently opens a conversation with somebody the panel
+  // never mentioned. Empty when the cursor is not on a bot.
+  readonly property string newBot: {
+    var row = (cursor >= 0 && cursor < rows.length) ? rows[cursor] : null
+    var bot = (row && (row.kind === "bot" || row.kind === "attach" || row.kind === "pinned"))
+              ? row.bot : null
+    return bot ? ("@" + bot.name) : ""
+  }
+  // What the bot is doing right now, before the turn lands in the store.
+  property var chatLiveWork: []
+  // Which work rows have been opened out. Keyed by position in the transcript.
+  property var workExpanded: ({})
+
+  // ---- keeping the window live ----------------------------------------------
+  // A one-shot reload after a send is a promise the window has to keep; if it does
+  // not fire, the conversation freezes and only leaving and re-entering fixes it.
+  // So the window does not rely on it: every roster tick checks the open session's
+  // message count and re-reads it when it moved. That covers a reply arriving from
+  // ANY surface - this window, the desktop, a cron delivery - within one poll.
+  property int chatRenderedCount: -1
+  property bool chatSeenInSnap: false
+  property bool chatRereadPending: false
+  // The message count when the current send started: what tells a landed reply
+  // apart from the turn that was already there.
+  property int chatSendCount: -1
+  // Which surface holds a writer's lease on the open conversation, '' when free.
+  // Hermes allows exactly one writer per session, so this is not advisory.
+  property string chatHeld: ""
+  // A read takes a moment, and the window can move on inside it. Every open bumps
+  // the epoch; a reply stamped with an older one is a reply about a conversation
+  // nobody is looking at any more, and applying it is how a stale transcript
+  // flashes into a window that already moved on.
+  property int chatEpoch: 0
+  property int threadEpoch: -1
+
+  // Start a conversation that belongs to nobody else. Hermes has no "make an empty
+  // chat" command - a chat is born from its first message - so the name is picked
+  // here and the id comes back on the stream once the chat exists. The name is
+  // deliberately dull and unique: it is what the desktop's sidebar will show.
+  function startNewChat(bot) {
+    if (!bot) return
+    var now = new Date()
+    // Seconds, not minutes: a chat is created by NAME, and --create-if-missing
+    // RESUMES a session whose name already exists. Two names that collide in the
+    // same minute would silently continue the previous chat instead of starting one.
+    var title = "Hermbot " + ("0" + now.getHours()).slice(-2) + ":"
+                + ("0" + now.getMinutes()).slice(-2) + ":"
+                + ("0" + now.getSeconds()).slice(-2)
+    chatEpoch += 1
+    threadEpoch = -1
+    chat = { bot: String(bot.name), title: title, session_id: "", isNew: true }
+    chatTurns = []
+    chatLive = ""
+    chatLiveWork = []
+    chatError = ""
+    chatPending = false
+    chatLoading = false
+    chatHeld = ""
+    chatRenderedCount = -1
+    chatSeenInSnap = false
+    chatRereadPending = false
+    chatSendCount = -1
+    chatSource = root.source
+    chatFocus.restart()
+  }
+
+  function startNewChatForCursor() {
+    var row = (cursor >= 0 && cursor < rows.length) ? rows[cursor] : null
+    var bot = (row && (row.kind === "bot" || row.kind === "attach" || row.kind === "pinned"))
+              ? row.bot : null
+    // A heading is not a bot: walk up to the nearest row that is one, and only then
+    // fall back to the top of the list. `n` must never be a silent no-op - and
+    // whatever it picks, the chat window names it.
+    if (!bot) {
+      for (var i = Math.min(cursor, rows.length - 1); i >= 0; i--) {
+        var r = rows[i]
+        if (r.kind === "bot" || r.kind === "attach" || r.kind === "pinned") { bot = r.bot; break }
+      }
+    }
+    if (!bot && bots.length > 0) bot = bots[0]
+    if (bot) root.startNewChat(bot)
+  }
+
+  // What the chat window is showing, as one line. Lives on the widget (not in the
+  // IPC handler) because the handlers call it too. Always JSON, and it carries the
+  // panel's own state first: a screenshot run has to prove the panel is actually up
+  // before it grabs, and `geometry` answers with the last card it knew about whether
+  // or not anything is on screen.
+  function chatStateText() {
+    var st = { panel: root.opened ? "open" : "closed",
+               roster: root.demoMode ? "demo" : "live" }
+    if (root.chat === null) return JSON.stringify(st)
+    st.bot = root.chat.bot
+    st.title = root.chat.title
+    st.session_id = root.chat.session_id
+    st.isNew = root.chat.isNew === true
+    st.held = root.chatHeld
+    st.turns = root.chatTurns.length
+    st.pending = root.chatPending
+    st.cursor = root.cursor
+    return JSON.stringify(st)
+  }
+
+  // The bot's own Bot Chat is the one conversation this window can always own: the
+  // desktop keeps it out of its sidebar, so nothing else holds it.
+  function botByName(name) {
+    for (var i = 0; i < bots.length; i++)
+      if (String(bots[i].name) === String(name)) return bots[i]
+    return null
+  }
+
+  function botChatOf(name) {
+    var bot = root.botByName(name)
+    return bot ? (bot.chat || null) : null
+  }
+
+  function canSwitchToBotChat() {
+    if (!root.chat) return false
+    var own = root.botChatOf(root.chat.bot)
+    return !!(own && own.session_id && String(own.session_id) !== String(root.chat.session_id))
+  }
+
+  function switchToBotChat() {
+    if (!root.chat || !root.canSwitchToBotChat()) return
+    var bot = root.botByName(root.chat.bot)
+    if (bot) root.openChat(bot, bot.chat)
+  }
+
+  function sessionCountIn(snap, sessionId) {
+    if (!snap || !snap.bots) return -1
+    for (var i = 0; i < snap.bots.length; i++) {
+      var b = snap.bots[i]
+      var a = b.attach
+      if (a && String(a.session_id) === sessionId) return Number(a.message_count || 0)
+      var pins = b.pinned || []
+      for (var j = 0; j < pins.length; j++)
+        if (String(pins[j].session_id) === sessionId) return Number(pins[j].message_count || 0)
+    }
+    return -1
+  }
+
+  function chatTick() {
+    if (root.chat === null) return
+    var count = root.sessionCountIn(root.snap, String(root.chat.session_id))
+    if (count < 0) { root.chatSeenInSnap = false; return }
+    root.chatSeenInSnap = true
+    if (count !== root.chatRenderedCount) root.reloadChat()
+  }
+
+  // Nothing may stall silently: if the roster stops carrying this session at all
+  // (its row moved on to a newer chat), ask for the thread directly instead.
+  Timer {
+    id: chatSafety
+    interval: 5000
+    repeat: true
+    running: root.chat !== null
+    onTriggered: if (!root.chatSeenInSnap) root.reloadChat()
+  }
+
+  function toggleWorkRow(index) {
+    var next = {}
+    for (var k in workExpanded) next[k] = workExpanded[k]
+    next[index] = !next[index]
+    workExpanded = next
+  }
+
+  // ---- transcript helpers ---------------------------------------------------
+  function escapeHtml(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+  }
+
+  // Links become clickable without ever letting message text turn into markup: the
+  // text is escaped first and only the URLs found here are wrapped. Trailing
+  // punctuation stays outside the anchor, so a link is not broken by a full stop.
+  function richText(s) {
+    var text = String(s)
+    var re = /https?:\/\/[^\s<>()"']+/g
+    var out = "", last = 0, m
+    while ((m = re.exec(text)) !== null) {
+      var url = m[0], trail = ""
+      while (url.length > 1 && ".,;:!?".indexOf(url.charAt(url.length - 1)) >= 0) {
+        trail = url.charAt(url.length - 1) + trail
+        url = url.slice(0, -1)
+      }
+      out += root.escapeHtml(text.slice(last, m.index))
+      out += '<a href="' + root.escapeHtml(url) + '">' + root.escapeHtml(url) + "</a>"
+      out += root.escapeHtml(trail)
+      last = m.index + m[0].length
+    }
+    return (out + root.escapeHtml(text.slice(last))).replace(/\n/g, "<br/>")
+  }
+
+  function openLink(url) {
+    var u = String(url || "")
+    if (u.indexOf("http://") === 0 || u.indexOf("https://") === 0)
+      Quickshell.execDetached(["xdg-open", u])
+  }
+
+  // A stored turn can carry `@image:<path>` - that is how the desktop hands an
+  // attachment over, and what a screenshot looks like once it is in the store.
+  // Text cannot draw an image, so the transcript pulls the refs out and draws them
+  // above the words. `[screenshot]` is a display marker that carries no path.
+  function imagePathsIn(text) {
+    var out = [], re = /@image:(\S+)/g, m
+    while ((m = re.exec(String(text))) !== null) out.push(m[1])
+    return out
+  }
+
+  function textWithoutImages(text) {
+    return String(text).replace(/@image:\S+/g, "").replace(/\[screenshot\]/g, "").trim()
+  }
+
+  function clockOf(ts) {
+    if (!ts) return ""
+    var d = new Date(Number(ts) * 1000)
+    return ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2)
+  }
+
+  // ---- attachments ----------------------------------------------------------
+  readonly property var imageSuffixes: [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]
+
+  function isImagePath(p) {
+    var s = String(p).toLowerCase()
+    for (var i = 0; i < root.imageSuffixes.length; i++)
+      if (s.slice(-root.imageSuffixes[i].length) === root.imageSuffixes[i]) return true
+    return false
+  }
+
+  function baseName(p) {
+    var s = String(p)
+    var cut = s.lastIndexOf("/")
+    return cut >= 0 ? s.slice(cut + 1) : s
+  }
+
+  function attachFile(p) {
+    var path = String(p || "").replace(/^file:\/\//, "")
+    if (path === "") return
+    for (var i = 0; i < chatAttach.length; i++)
+      if (chatAttach[i].path === path) return
+    chatAttach = chatAttach.concat([{ path: path, name: root.baseName(path),
+                                      image: root.isImagePath(path) }])
+    chatFocus.restart()
+  }
+
+  function detachFile(index) {
+    var out = []
+    for (var i = 0; i < chatAttach.length; i++) if (i !== index) out.push(chatAttach[i])
+    chatAttach = out
+  }
+
+  function clearAttach() { chatAttach = [] }
+
+  // ---- the file browser -----------------------------------------------------
+  // In-panel on purpose. The panel is a full-screen surface on WlrLayer.Overlay, so
+  // a separate chooser can only ever appear UNDERNEATH it - and the platform dialog
+  // on this machine is the GTK one that looks like Nautilus. Browsing here keeps
+  // everything above the chat, never loses focus, and reads as the same widget.
+  function openPicker() {
+    pickerOpen = true
+    root.browseTo("")
+  }
+
+  function closePicker() {
+    pickerOpen = false
+    pickerEntries = []
+    pickerError = ""
+    chatFocus.restart()
+  }
+
+  function browseTo(dir) {
+    pickerError = ""
+    pickerEntries = []
+    lsProc.command = [root.watcher, "--ls", String(dir || ""), "--limit", "400",
+                      "--source", chatSource]
+    lsProc.running = true
+  }
+
+  function pickEntry(entry) {
+    if (!entry) return
+    if (entry.dir) { root.browseTo(entry.path); return }
+    root.attachFile(entry.path)
+    root.closePicker()
+  }
+
+  function humanSize(bytes) {
+    var n = Number(bytes || 0)
+    if (n < 1024) return n + " B"
+    if (n < 1048576) return Math.round(n / 1024) + " K"
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + " M"
+    return (n / 1073741824).toFixed(1) + " G"
+  }
 
   function setting(name, fallback) {
     var s = root.settings || ({})
@@ -105,6 +429,29 @@ Panel {
   property bool demoMode: false
   property double demoStart: 0
   property bool demoNeedsHelp: true
+  // The staged conversation the chat window shows in demo mode. Ages are relative to
+  // when demo mode was switched on, so the clocks stay believable.
+  readonly property var demoThread: {
+    var t = (demoStart || Date.now()) / 1000
+    var ago = function(mins) { return t - mins * 60 }
+    return [
+      { role: "user", ts: ago(6),
+        text: "Run the watcher twice at the same instant and tell me whether the lock holds." },
+      { role: "think", ts: ago(6),
+        text: "Two processes, one lock file. Start both, then compare exit codes and how long the second one waited." },
+      { role: "call", ts: ago(5), text: "terminal · ls -la ~/.local/state/omarchy/hermbot/" },
+      { role: "result", ts: ago(5),
+        text: "terminal · total 12\n-rw-r--r-- 1 ozz1ee ozz1ee 412 seen.json\n-rw-r--r-- 1 ozz1ee ozz1ee   0 watcher.lock" },
+      { role: "call", ts: ago(4),
+        text: "terminal · python3 -c \"start two watchers at once, time both to exit\"" },
+      { role: "result", ts: ago(4),
+        text: "terminal · first exit 0 in 0.03s, second exit 0 in 0.44s - the second waited for the lock" },
+      { role: "think", ts: ago(3),
+        text: "Both exited cleanly and the second blocked for four tenths of a second. The race is closed." },
+      { role: "bot", ts: ago(2),
+        text: "The race is real, and it is closed. Two watchers started at the same instant:\n\n- the first took the lock and finished in 0.03s\n- the second waited 0.44s, then read the state the first had written\n\nNo double write, and the state file ends on a single consistent snapshot." }
+    ]
+  }
   readonly property var demoSnap: {
     var t = (demoStart || Date.now()) / 1000
     var ago = function(mins) { return t - mins * 60 }
@@ -349,6 +696,177 @@ Panel {
     onExited: function(code) { console.warn("hermbot", "watcher exited", code); restartTimer.start() }
   }
   Timer { id: restartTimer; interval: 5000; onTriggered: watcherProc.running = true }
+
+  // ------------------------------------------------------------------- chat io
+  // Reading one conversation, and delivering a message into it. Both go through
+  // the same scripts the roster uses, so a remote source behaves the same way -
+  // and the text never touches a shell: it reaches hermbot-send as argv, and from
+  // there the agent reads it out of a file.
+  Process {
+    id: threadProc
+    running: false
+    stdout: SplitParser {
+      onRead: function(line) {
+        var d
+        try { d = JSON.parse(String(line)) } catch (e) { return }
+        if (!d || d.kind !== "thread") return
+        // The window moved on while this read was in flight: its answer describes a
+        // conversation nobody is looking at, and applying it is exactly what made a
+        // stale transcript flash into a freshly opened chat.
+        if (root.threadEpoch !== root.chatEpoch) return
+        var out = []
+        // In demo mode the chat is staged too. The demo roster carries session ids no
+        // store knows, so reading one returns nothing and a screenshot of the chat
+        // window would be a screenshot of an empty window. This is the shape a real
+        // turn has: a question, the work, the answer.
+        if (root.demoMode) out = root.demoThread
+        else {
+        var turns = d.turns || []
+        for (var i = 0; i < turns.length; i++)
+          out.push({ role: String(turns[i].role), text: String(turns[i].text),
+                     ts: turns[i].ts || 0 })
+        }
+        root.chatTurns = out
+        root.chatRenderedCount = Number(d.message_count || 0)
+        // Who holds the write lease. Re-read on every tick, so the window knows the
+        // moment the desktop opens or releases the chat.
+        root.chatHeld = String(d.held || "")
+        var last = out.length > 0 ? String(out[out.length - 1].role) : ""
+        // A bot turn in the store means the turn is over, whatever the send process
+        // reports. Without this the window can stay locked on a process that never
+        // announces its exit - and then you cannot even send a second message.
+        var landed = last === "bot" && root.chatSendCount >= 0
+                     && root.chatRenderedCount > root.chatSendCount
+        if (landed) {
+          root.chatPending = false
+          root.chatSendCount = -1
+        }
+        // The courtesy tail is only worth keeping while the reply is not in the
+        // store yet; otherwise the reload would print the same answer twice.
+        if (!root.chatPending || landed) {
+          root.chatLive = ""
+          root.chatLiveWork = []
+        }
+        root.chatLoading = false
+        // A demo session is in no store, so the read reports that it cannot be found.
+        // True, and useless here: the window is showing a staged transcript and the
+        // message would sit under the input box in every demo screenshot.
+        if (d.error && !root.demoMode) root.chatError = String(d.error)
+        if (root.chat && d.bot)
+          root.chat = { bot: String(d.bot),
+                        title: String(d.title || root.chat.title),
+                        session_id: root.chat.session_id,
+                        isNew: root.chat.isNew === true }
+      }
+    }
+    stderr: SplitParser {
+      onRead: function(data) {
+        var s = String(data).trim()
+        if (s !== "") console.warn("hermbot chat", s)
+      }
+    }
+    onExited: function(code) {
+      root.chatLoading = false
+      // A tick that arrived mid-read asked for another one.
+      if (root.chatRereadPending) root.reloadChat()
+    }
+  }
+
+  Process {
+    id: sendProc
+    running: false
+    stdout: SplitParser {
+      onRead: function(line) {
+        var d
+        try { d = JSON.parse(String(line)) } catch (e) { return }
+        if (!d) return
+        if (d.type === "text" && d.text) {
+          root.chatLive = root.chatLive + String(d.text)
+        } else if (d.type === "tool_use") {
+          // The bot is reaching for something. Showing it the moment it happens is
+          // the whole reason the stream carries these events.
+          root.chatLiveWork = root.chatLiveWork.concat([
+            { role: "call", text: root.callLine(String(d.name || "tool"), d.input) }])
+        } else if (d.type === "tool_result") {
+          root.chatLiveWork = root.chatLiveWork.concat([
+            { role: "result", text: root.resultLine(String(d.name || "tool"), d.output) }])
+        } else if (d.type === "hermbot" && d.session_id) {
+          // Our own line, after the agent's stream: the chat this turn created now
+          // exists, so the window adopts its id and can read it back from here on.
+          if (root.chat) {
+            root.chat = { bot: root.chat.bot,
+                          title: String(d.title || root.chat.title),
+                          session_id: String(d.session_id), isNew: false }
+            root.chatRenderedCount = -1
+            root.reloadChat()
+          }
+        } else if (d.type === "result" && d.exit_code !== undefined && d.exit_code !== 0) {
+          root.chatError = "the turn failed (exit " + d.exit_code + ")"
+        }
+      }
+    }
+    stderr: SplitParser {
+      onRead: function(data) {
+        var s = String(data).trim()
+        if (s === "") return
+        // The machine-readable reason line the CLI adds for one-shot subprocesses.
+        if (s.indexOf("hermes-refusal-reason:") === 0) return
+        // The one refusal worth translating. Hermes allows a single writer per
+        // session on purpose - two surfaces on one conversation corrupt it - so this
+        // is not a bug to paper over, it is a door that is shut.
+        if (s.indexOf("open in another Hermes") >= 0) {
+          root.chatError = "This chat is open in Hermes Desktop right now, and Hermes "
+                         + "allows one writer per chat. Close it there, or pick the bot "
+                         + "itself from the roster to talk in its own Bot Chat."
+          return
+        }
+        // Anything else the agent said about why it failed is the most useful thing
+        // this window can show, so it is surfaced rather than only logged.
+        root.chatError = s
+        console.warn("hermbot chat", s)
+      }
+    }
+    onExited: function(code) {
+      root.chatPending = false
+      if (code !== 0 && root.chatError === "") root.chatError = "the send exited " + code
+      // A beat before re-reading: the row is written as the turn completes, and
+      // this is what keeps the window from flashing an empty reply.
+      chatSettle.restart()
+    }
+  }
+
+  // Focus follows the window, not the click: after sending, the box is ready again.
+  Timer { id: chatFocus; interval: 80; onTriggered: if (root.chat !== null) chatInput.forceActiveFocus() }
+  Timer { id: chatSettle; interval: 350; onTriggered: root.reloadChat() }
+
+  // The directory listing behind the in-panel browser. One call per directory, so
+  // nothing walks the filesystem in the background.
+  Process {
+    id: lsProc
+    running: false
+    stdout: SplitParser {
+      onRead: function(line) {
+        var d
+        try { d = JSON.parse(String(line)) } catch (e) { return }
+        if (!d || d.kind !== "ls") return
+        root.pickerDir = String(d.dir || "")
+        root.pickerParent = String(d.parent || "")
+        root.pickerError = String(d.error || "")
+        var out = []
+        var es = d.entries || []
+        for (var i = 0; i < es.length; i++)
+          out.push({ name: String(es[i].name), path: String(es[i].path),
+                     dir: !!es[i].dir, size: Number(es[i].size || 0) })
+        root.pickerEntries = out
+      }
+    }
+    stderr: SplitParser {
+      onRead: function(data) {
+        var s = String(data).trim()
+        if (s !== "") console.warn("hermbot files", s)
+      }
+    }
+  }
   // A settings change has to land on the command line, and a running Process
   // will not pick up a new command: bounce it.
   onNotifyOnMessageChanged: { watcherProc.running = false; restartTimer.restart() }
@@ -360,6 +878,8 @@ Panel {
       if (parsed && typeof parsed === "object" && Array.isArray(parsed.bots)) {
         root.liveSnap = parsed
         root.nowMs = Date.now()
+        // The roster's own poll is the heartbeat the chat window rides on.
+        root.chatTick()
       }
     } catch (e) {
       console.warn("hermbot", "bad state line", e)
@@ -449,6 +969,224 @@ Panel {
     root.close()
   }
 
+  // ------------------------------------------------------------------ the chat
+  // Open a conversation in the panel. The thread is read from the bot's own store,
+  // and whatever is typed is delivered into THAT session - not into the canonical
+  // Bot Chat - so the reply lands in the conversation on screen. That is the whole
+  // point of the window: the row you picked is the row you talk in.
+  function openChat(bot, session) {
+    if (!bot || !session) return
+    var sid = String(session.session_id || "")
+    if (!sid) return
+    chatEpoch += 1
+    threadEpoch = -1
+    chat = { bot: String(bot.name),
+             title: String(session.title || bot.title || bot.name),
+             session_id: sid }
+    chatTurns = []
+    chatLive = ""
+    chatError = ""
+    chatPending = false
+    chatLoading = true
+    chatLiveWork = []
+    workExpanded = ({})
+    chatRenderedCount = -1
+    chatSeenInSnap = false
+    chatRereadPending = false
+    chatSendCount = -1
+    chatHeld = ""
+    chatSource = root.source
+    root.reloadChat()
+    chatFocus.restart()
+  }
+
+  function closeChat() {
+    if (sendProc.running) sendProc.running = false
+    chatEpoch += 1
+    threadEpoch = -1
+    chat = null
+    chatTurns = []
+    chatLive = ""
+    chatError = ""
+    chatPending = false
+    chatLoading = false
+    chatLiveWork = []
+    chatRenderedCount = -1
+    chatSeenInSnap = false
+    chatRereadPending = false
+    chatSendCount = -1
+    chatHeld = ""
+    root.clearAttach()
+    // The chat's input held the keys. Leaving them on an item that is now hidden is
+    // how the roster ends up deaf: `n`, `r`, `p`, `s` all stop answering and the
+    // panel looks broken without a single error in the log.
+    keyCatcher.forceActiveFocus()
+  }
+
+  // The read behind the transcript. With the work shown the window needs many more
+  // rows, because one turn can be twenty of them.
+  function threadCommand() {
+    var cmd = [root.watcher, "--thread", root.chat.session_id, "--source", chatSource]
+    if (root.showWork) return cmd.concat(["--limit", "240", "--work"])
+    return cmd.concat(["--limit", "80"])
+  }
+
+  function toggleWork() {
+    showWork = !showWork
+    Quickshell.execDetached(["omarchy", "bar", "set", "ozz1ee.hermbot", "showWork",
+                             showWork ? "true" : "false"])
+    if (root.chat !== null) root.reloadChat()
+  }
+
+  // One line for a call the bot made, from the stream's input object or the store's
+  // JSON string. Same argument keys the reader prefers, so both views read alike.
+  function callLine(name, input) {
+    var args = input
+    if (typeof args === "string") {
+      try { args = JSON.parse(args) } catch (e) { args = null }
+    }
+    var hint = ""
+    if (args && typeof args === "object") {
+      var keys = ["command", "path", "file_path", "query", "pattern", "url",
+                  "prompt", "text", "name"]
+      for (var i = 0; i < keys.length; i++) {
+        var v = args[keys[i]]
+        if (typeof v === "string" && v.trim() !== "") { hint = v; break }
+      }
+      if (hint === "") {
+        for (var k in args) {
+          if (typeof args[k] === "string" && args[k].trim() !== "") { hint = args[k]; break }
+        }
+      }
+    }
+    hint = (" " + hint).split(/\s+/).join(" ").trim()
+    return String(name) + (hint !== "" ? " · " + hint.slice(0, 130) : "")
+  }
+
+  // One line for a result: the first thing it actually said, an error first.
+  function resultLine(name, output) {
+    var text = String(output || "")
+    if (text.trim().charAt(0) === "{") {
+      try {
+        var p = JSON.parse(text)
+        if (p && typeof p === "object")
+          text = p.error ? ("error: " + p.error) : String(p.output || p.text || "")
+      } catch (e) { }
+    }
+    var lines = text.split("\n")
+    var first = ""
+    for (var i = 0; i < lines.length; i++)
+      if (lines[i].trim() !== "") { first = lines[i].trim(); break }
+    return String(name) + (first !== "" ? " · " + first.slice(0, 150) : "")
+  }
+
+  // How the work reads in the transcript. The reader hands over 'name · detail' for
+  // a call or a result, so the two halves split cleanly into a tag and a body.
+  function workLabel(role, text) {
+    if (role === "think") return "thinking"
+    if (role === "call") return "⚙ " + String(text).split(" · ")[0]
+    if (role === "result") return "✓ " + String(text).split(" · ")[0]
+    return ""
+  }
+
+  function workBody(role, text) {
+    if (role !== "call" && role !== "result") return String(text)
+    var cut = String(text).indexOf(" · ")
+    return cut >= 0 ? String(text).slice(cut + 3) : ""
+  }
+
+  function roleLabel(role, bot) {
+    if (role === "user") return "YOU"
+    if (role === "bot") return "@" + bot
+    return ""
+  }
+
+  function roleColor(role) {
+    if (role === "user") return root.dim
+    if (role === "bot") return root.accent
+    if (role === "think") return root.faint
+    if (role === "call") return root.dim
+    return root.faint
+  }
+
+  function isWorkRole(role) {
+    return role === "think" || role === "call" || role === "result"
+  }
+
+  // The store is the truth: the streaming tail is a courtesy, and this is what
+  // makes the window correct when a turn failed, was interrupted, or wrote more
+  // than the stream carried.
+  function reloadChat() {
+    if (!root.chat) return
+    // A chat that does not exist yet has nothing to read: its id arrives with the
+    // first message.
+    if (root.chat.isNew) return
+    // One read at a time: a tick landing while the previous read is still in flight
+    // must not queue a second process for the same answer.
+    if (threadProc.running) { root.chatRereadPending = true; return }
+    root.chatRereadPending = false
+    // Stamp the read so its answer can be recognised as belonging to this window.
+    root.threadEpoch = root.chatEpoch
+    threadProc.command = root.threadCommand()
+    threadProc.running = true
+  }
+
+  function sendChat() {
+    var text = String(chatInput.text || "")
+    if (!root.chat || root.chatPending) return
+    // Never fire a write the lease will refuse: it would cost a turn's worth of
+    // waiting to learn what the header already says.
+    if (root.chatHeld !== "") {
+      root.chatError = "This chat is open in " + root.chatHeld
+                     + ", and Hermes allows one writer per chat. Use the link above "
+                     + "to talk in the bot's own Bot Chat."
+      return
+    }
+    if (text.trim() === "" && chatAttach.length === 0) return
+    // Files ride the turn the way the desktop hands them over: an image goes
+    // through --image so the model actually SEES it, anything else becomes an
+    // @file: reference the agent inlines. Credential paths are refused by the
+    // agent's own deny-list, not by anything here.
+    var refs = [], image = ""
+    for (var i = 0; i < chatAttach.length; i++) {
+      var a = chatAttach[i]
+      if (a.image && image === "") image = a.path
+      else refs.push("@file:" + (/\s/.test(a.path) ? "`" + a.path + "`" : a.path))
+    }
+    var body = text
+    if (refs.length > 0) body = (body.trim() === "" ? "" : body + "\n") + refs.join(" ")
+    if (body.trim() === "") body = "(see the attached image)"
+    // Echo it now: the agent takes a few seconds to even record the turn, and a
+    // box that appears to swallow what you typed reads as broken.
+    chatTurns = chatTurns.concat([{ role: "user", text: body,
+                                    ts: Math.floor(Date.now() / 1000) }])
+    chatLive = ""
+    chatLiveWork = []
+    chatError = ""
+    chatPending = true
+    chatSendCount = root.chatRenderedCount
+    chatInput.text = ""
+    // A brand-new chat is addressed by NAME: it does not exist yet, so there is no
+    // id to resume. Its id arrives on the stream once the first turn creates it.
+    var cmd = [root.sender, "--bot", root.chat.bot]
+    if (root.chat.isNew) cmd = cmd.concat(["--title", root.chat.title])
+    else cmd = cmd.concat(["--session", root.chat.session_id])
+    cmd = cmd.concat(["--stream", "--text", body])
+    if (image !== "") cmd = cmd.concat(["--image", image])
+    sendProc.command = cmd
+    sendProc.running = true
+    root.clearAttach()
+    chatFocus.restart()
+  }
+
+  // The old behaviour, kept on its own key: hand the row to Hermes Desktop.
+  function openRowInDesktop(index) {
+    if (index < 0 || index >= rows.length) return
+    var row = rows[index]
+    if (row.kind === "bot") root.openBot(row.bot)
+    else if (row.kind === "attach" || row.kind === "pinned") root.openSession(row.bot, row.session)
+  }
+
   function togglePinned() {
     showPinned = !showPinned
     Quickshell.execDetached(["omarchy", "bar", "set", "ozz1ee.hermbot", "showPinned",
@@ -468,8 +1206,21 @@ Panel {
   function activateRow(index) {
     if (index < 0 || index >= rows.length) return
     var row = rows[index]
-    if (row.kind === "bot") root.openBot(row.bot)
-    else if (row.kind === "attach" || row.kind === "pinned") root.openSession(row.bot, row.session)
+    if (row.kind === "bot") {
+      // The bot row talks in the bot's own forever-chat, not in whichever visible
+      // session happens to be newest. Hermes allows exactly ONE writer per session
+      // and the desktop holds a lease on the chat it has open - so a visible
+      // session is usually the one that will refuse. The canonical Bot Chat is
+      // hidden from the desktop's sidebar, which is what makes it this window's own.
+      var own = row.bot.chat || row.bot.attach
+      if (own && own.session_id) root.openChat(row.bot, own)
+      else root.openBot(row.bot)
+    } else if (row.kind === "attach" || row.kind === "pinned") {
+      // A session row is the desktop's conversation: it may be open there, and then
+      // Hermes will refuse the write. The window says so plainly rather than failing
+      // silently.
+      root.openChat(row.bot, row.session)
+    }
   }
 
   function clickRow(index) {
@@ -505,6 +1256,60 @@ Panel {
     function scrub(): string { root.scrub = !root.scrub; return root.scrub ? "scrubbed" : "clear" }
     function group(): string { root.cycleOrdering(); return root.ordering }
     function order(mode: string): string { root.ordering = mode; return root.ordering }
+    // Open a conversation from outside: `omarchy-shell ozz1ee.hermbot openThread <id>`.
+    // Same reason the demo helpers exist - a panel loses focus the moment you type
+    // the command in a terminal, so a screenshot run needs a way in that is not a
+    // click. It also makes the window reachable from a keybinding later.
+    function openThread(sessionId: string): string {
+      var sid = String(sessionId || "")
+      if (sid === "") return "usage: openThread <session-id>"
+      for (var i = 0; i < bots.length; i++) {
+        var b = bots[i]
+        if (b.chat && String(b.chat.session_id) === sid) {
+          root.openChat(b, b.chat)
+          return "chat " + sid
+        }
+        if (b.attach && String(b.attach.session_id) === sid) {
+          root.openChat(b, b.attach)
+          return "chat " + sid
+        }
+        var pins = b.pinned || []
+        for (var j = 0; j < pins.length; j++) {
+          if (String(pins[j].session_id) === sid) {
+            root.openChat(b, pins[j])
+            return "chat " + sid
+          }
+        }
+      }
+      return "no row carries " + sid
+    }
+    // What the chat window is showing right now. Exists for probes that cannot
+    // click or type - a screenshot run, or working out why a key did nothing.
+    function chatState(): string { return root.chatStateText() }
+    // The same call the `n` key makes, so the key and the function can be told apart.
+    function newChat(): string {
+      root.startNewChatForCursor()
+      return root.chatStateText()
+    }
+    // Back to the roster without a keystroke, so a probe can reach that state.
+    function closeChat(): string {
+      root.closeChat()
+      return "roster"
+    }
+    // The file browser and the attachment tray, for a screenshot run: the picker only
+    // opens on a click, and a probe has no mouse.
+    function picker(dir: string): string {
+      if (!root.opened) root.open()
+      root.openPicker()
+      if (dir) root.browseTo(String(dir))
+      return JSON.stringify({ open: root.pickerOpen, dir: root.pickerDir,
+                              entries: root.pickerEntries.length })
+    }
+    function attach(path: string): string {
+      if (!root.opened) root.open()
+      root.attachFile(String(path))
+      return JSON.stringify({ attached: root.chatAttach.length })
+    }
     // A staged roster for screenshots; call again to go back to the real one.
     function demo(): string {
       root.toggleDemo()
@@ -851,12 +1656,18 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(420))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight + Style.space(16), Style.space(900))
+    // The chat wants room to read and type in; the roster is a list and stays
+    // narrow. Both are clamped to what the screen actually offers.
+    contentWidth: panel.fittedContentWidth(root.chat !== null ? Style.space(720) : Style.space(420))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight + Style.space(2), Style.space(900))
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      // While the message box holds the keys they are its own: this handler claims
+      // j/k/h/l, space, x and Enter, so an unblocked catcher would eat every letter
+      // of what you type. This is the upstream panel-editor pattern.
+      blocked: root.chat !== null && chatInput.activeFocus
 
       onMoveRequested: function(dx, dy) {
         if (dx < 0) root.scrub = !root.scrub
@@ -870,6 +1681,9 @@ Panel {
         else if (t === "g" || t === "G") root.cycleOrdering()
         else if (t === "p" || t === "P") root.togglePinned()
         else if (t === "s" || t === "S") root.cycleSource()
+        else if (t === "o" || t === "O") root.openRowInDesktop(root.cursor)
+        else if (t === "w" || t === "W") root.toggleWork()
+        else if (t === "n" || t === "N") root.startNewChatForCursor()
       }
 
       // Where the pointer is, in panel coordinates. Avatars map it into their
@@ -910,7 +1724,10 @@ Panel {
         id: panelFlick
         anchors.fill: parent
         contentWidth: width
-        contentHeight: column.implicitHeight + Style.space(8)
+        // Exactly the column. The card already carries popupPadding on every side,
+        // and slack here stacked on top of it: the gap under the footer came to more
+        // than twice the gap above the header, which reads as wasted space.
+        contentHeight: column.implicitHeight
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         flickableDirection: Flickable.VerticalFlick
@@ -968,6 +1785,691 @@ Panel {
 
           Rectangle { width: parent.width; height: 1; color: root.faint }
 
+          // ---- the chat window ------------------------------------------------
+          // Shown instead of the roster when a row opened a conversation. Same
+          // fonts, same colours, same spacing as the list, so it reads as this
+          // panel rather than a different app.
+          Item {
+            id: chatView
+            width: parent.width
+            visible: root.chat !== null
+            height: visible ? chatBody.implicitHeight : 0
+
+            Column {
+              id: chatBody
+              width: parent.width
+              spacing: 0
+
+              // ---- who you are talking to, and the way back
+              Item {
+                width: parent.width
+                height: Style.space(30)
+                Text {
+                  id: backText
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: "‹ back"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  MouseArea {
+                    anchors.fill: parent
+                    anchors.margins: -Style.space(4)
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.closeChat()
+                  }
+                }
+                // The work toggle lives in the header because it changes what the
+                // transcript IS, and `w` alone would be undiscoverable.
+                Text {
+                  id: workText
+                  anchors.left: backText.right
+                  anchors.leftMargin: Style.space(16)
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: root.showWork ? "stream on" : "stream off"
+                  color: workToggle.containsMouse ? root.fg : root.faint
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  MouseArea {
+                    id: workToggle
+                    anchors.fill: parent
+                    anchors.margins: -Style.space(4)
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.toggleWork()
+                  }
+                }
+                // A fresh conversation, started here rather than in the desktop.
+                Text {
+                  id: newText
+                  anchors.left: workText.right
+                  anchors.leftMargin: Style.space(16)
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: "+ new"
+                  color: newArea.containsMouse ? root.fg : root.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  MouseArea {
+                    id: newArea
+                    anchors.fill: parent
+                    anchors.margins: -Style.space(4)
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.startNewChat(root.botByName(root.chat ? root.chat.bot : ""))
+                  }
+                }
+                // A chat that does not exist yet says so AND says who it is with: `n`
+                // acts on the row under the cursor, and a conversation with an
+                // unnamed bot is not something to type into.
+                Text {
+                  id: newNoteText
+                  anchors.left: newText.right
+                  anchors.leftMargin: Style.space(16)
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  visible: root.chat !== null && root.chat.isNew === true
+                  text: "new chat with @" + (root.chat ? root.chat.bot : "")
+                  color: root.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+                // A held chat is not a detail: it means nothing you type can be
+                // written, so it is said in the header rather than discovered by a
+                // send that goes nowhere. It sits in the LEFT chain with the other
+                // state markers - right-aligned it landed on top of the title.
+                Text {
+                  anchors.left: newNoteText.visible ? newNoteText.right : newText.right
+                  anchors.leftMargin: Style.space(16)
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  visible: root.chatHeld !== ""
+                  text: "held by " + root.chatHeld
+                  color: root.urgent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+                Text {
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width - Style.space(300)
+                  horizontalAlignment: Text.AlignRight
+                  elide: Text.ElideLeft
+                  textFormat: Text.PlainText
+                  text: root.chat ? (root.chat.title + "  @" + root.chat.bot) : ""
+                  color: root.faint
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              Rectangle { width: parent.width; height: 1; color: root.faint }
+
+              // ---- the transcript, always parked on the newest turn
+              Flickable {
+                id: transcript
+                width: parent.width
+                height: root.pickerOpen ? Style.space(260) : Style.space(520)
+                contentWidth: width
+                contentHeight: turns.implicitHeight + Style.space(8)
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                flickableDirection: Flickable.VerticalFlick
+                interactive: contentHeight > height
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                onContentHeightChanged: contentY = Math.max(0, contentHeight - height)
+
+                Column {
+                  id: turns
+                  x: Style.space(4)
+                  width: parent.width - Style.space(8)
+                  topPadding: Style.space(4)
+                  spacing: Style.space(6)
+
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    visible: root.chatLoading && root.chatTurns.length === 0
+                    text: "reading the conversation…"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    visible: !root.chatLoading && root.chatTurns.length === 0 && root.chatLive === ""
+                    text: "nothing said here yet."
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Repeater {
+                    model: root.chatTurns
+
+                    Column {
+                      id: turnBlock
+                      required property var modelData
+                      width: turns.width
+                      spacing: Style.space(1)
+
+                      Row {
+                        spacing: Style.space(6)
+                        Text {
+                          textFormat: Text.PlainText
+                          text: root.isWorkRole(turnBlock.modelData.role)
+                                ? root.workLabel(turnBlock.modelData.role,
+                                                 turnBlock.modelData.text)
+                                : root.roleLabel(turnBlock.modelData.role,
+                                                 root.chat ? root.chat.bot : "")
+                          color: root.roleColor(turnBlock.modelData.role)
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                        }
+                        Text {
+                          textFormat: Text.PlainText
+                          visible: !root.isWorkRole(turnBlock.modelData.role)
+                                   && root.clockOf(turnBlock.modelData.ts) !== ""
+                          text: root.clockOf(turnBlock.modelData.ts)
+                          color: root.faint
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                        }
+                        Text {
+                          textFormat: Text.PlainText
+                          visible: root.isWorkRole(turnBlock.modelData.role)
+                          text: root.workExpanded[turnBlock.index] ? "less" : "more"
+                          color: root.faint
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          MouseArea {
+                            anchors.fill: parent
+                            anchors.margins: -Style.space(4)
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.toggleWorkRow(turnBlock.index)
+                          }
+                        }
+                      }
+                      // Anything the turn carried as an image, drawn as itself.
+                      Repeater {
+                        model: root.imagePathsIn(turnBlock.modelData.text)
+
+                        Rectangle {
+                          id: shot
+                          required property string modelData
+                          width: Math.min(Style.space(380), turns.width)
+                          height: Style.space(210)
+                          color: "transparent"
+                          border.color: root.faint
+                          border.width: 1
+
+                          Image {
+                            anchors.fill: parent
+                            anchors.margins: 1
+                            source: "file://" + shot.modelData
+                            fillMode: Image.PreserveAspectFit
+                            asynchronous: true
+                            sourceSize.width: 760
+                            sourceSize.height: 420
+                          }
+                          MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: Quickshell.execDetached(["xdg-open", shot.modelData])
+                          }
+                        }
+                      }
+                      Text {
+                        width: parent.width
+                        visible: text !== ""
+                        textFormat: Text.RichText
+                        wrapMode: Text.Wrap
+                        // The work can run long, and it is context rather than the
+                        // conversation: a few lines until you ask for the rest.
+                        maximumLineCount: root.isWorkRole(turnBlock.modelData.role)
+                                          && !root.workExpanded[turnBlock.index] ? 4 : 100000
+                        elide: root.isWorkRole(turnBlock.modelData.role)
+                               && !root.workExpanded[turnBlock.index] ? Text.ElideRight
+                                                                      : Text.ElideNone
+                        text: root.richText(root.isWorkRole(turnBlock.modelData.role)
+                              ? root.workBody(turnBlock.modelData.role,
+                                              turnBlock.modelData.text)
+                              : root.textWithoutImages(turnBlock.modelData.text))
+                        color: root.isWorkRole(turnBlock.modelData.role)
+                               ? (turnBlock.modelData.role === "result" ? root.dim : root.faint)
+                               : root.fg
+                        linkColor: root.accent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        onLinkActivated: function(link) { root.openLink(link) }
+                      }
+                    }
+                  }
+
+                  // What the bot is doing right now, straight off the stream: the
+                  // desktop's "it is working" made visible while it works.
+                  Repeater {
+                    model: root.chatLiveWork
+
+                    Column {
+                      id: liveWork
+                      required property var modelData
+                      width: turns.width
+                      spacing: Style.space(1)
+                      // The live tail obeys the same switch as the history. Leaving it
+                      // unconditional made `stream off` mean "shown while it runs, then
+                      // gone" - which reads as a glitch, not a setting.
+                      visible: root.showWork
+                      height: visible ? implicitHeight : 0
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: root.workLabel(liveWork.modelData.role, liveWork.modelData.text)
+                        color: root.roleColor(liveWork.modelData.role)
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                      Text {
+                        width: parent.width
+                        visible: text !== ""
+                        textFormat: Text.RichText
+                        wrapMode: Text.Wrap
+                        maximumLineCount: 3
+                        elide: Text.ElideRight
+                        text: root.richText(root.workBody(liveWork.modelData.role,
+                                                          liveWork.modelData.text))
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                      }
+                    }
+                  }
+
+                  // The reply as it is written, before the store has it.
+                  Column {
+                    width: turns.width
+                    spacing: Style.space(1)
+                    visible: root.chatLive !== ""
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "@" + (root.chat ? root.chat.bot : "")
+                      color: root.accent
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                    Text {
+                      width: parent.width
+                      textFormat: Text.PlainText
+                      wrapMode: Text.Wrap
+                      text: root.chatLive
+                      color: root.fg
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                    }
+                  }
+
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    visible: root.chatPending && root.chatLive === ""
+                    text: "thinking…"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+
+              Rectangle { width: parent.width; height: 1; color: root.faint }
+
+              // ---- files queued for the next turn
+              Flow {
+                width: parent.width
+                spacing: Style.space(4)
+                topPadding: Style.space(4)
+                visible: root.chatAttach.length > 0
+
+                Repeater {
+                  model: root.chatAttach
+
+                  Rectangle {
+                    id: chip
+                    required property var modelData
+                    required property int index
+                    readonly property bool isImage: !!modelData.image
+                    width: Math.min(chipRow.implicitWidth + Style.space(14), turns.width)
+                    height: isImage ? Style.space(40) : Style.space(18)
+                    color: "transparent"
+                    border.color: root.faint
+                    border.width: 1
+                    radius: 2
+
+                    Row {
+                      id: chipRow
+                      anchors.centerIn: parent
+                      spacing: Style.space(6)
+
+                      // An image you are about to send, shown as itself. Without it
+                      // the only clue is a filename, which is not what you check.
+                      Image {
+                        visible: chip.isImage
+                        source: chip.isImage ? "file://" + chip.modelData.path : ""
+                        width: Style.space(32)
+                        height: Style.space(32)
+                        fillMode: Image.PreserveAspectCrop
+                        asynchronous: true
+                        sourceSize.width: 128
+                        sourceSize.height: 128
+                      }
+                      Text {
+                        textFormat: Text.PlainText
+                        text: (chip.isImage ? "" : "▤ ") + chip.modelData.name
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        elide: Text.ElideMiddle
+                        height: chip.height
+                        verticalAlignment: Text.AlignVCenter
+                        width: Math.min(implicitWidth, Style.space(150))
+                      }
+                      Text {
+                        textFormat: Text.PlainText
+                        text: "×"
+                        color: chipDrop.containsMouse ? root.urgent : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        height: chip.height
+                        verticalAlignment: Text.AlignVCenter
+                        MouseArea {
+                          id: chipDrop
+                          anchors.fill: parent
+                          anchors.margins: -Style.space(4)
+                          hoverEnabled: true
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: root.detachFile(chip.index)
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+
+              // ---- the box
+              Item {
+                width: parent.width
+                height: Style.space(52)
+
+                // Attach: hands off to the platform picker, and whatever comes back
+                // is queued as a chip above.
+                Text {
+                  id: attachButton
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: "＋"
+                  color: attachArea.containsMouse ? root.fg : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  MouseArea {
+                    id: attachArea
+                    anchors.fill: parent
+                    anchors.margins: -Style.space(6)
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.openPicker()
+                  }
+                }
+
+                TextField {
+                  id: chatInput
+                  anchors.left: attachButton.right
+                  anchors.leftMargin: Style.space(14)
+                  anchors.right: sendButton.left
+                  anchors.rightMargin: Style.space(10)
+                  anchors.verticalCenter: parent.verticalCenter
+                  enabled: !root.chatPending && root.chatHeld === ""
+                  placeholderText: root.chatHeld !== ""
+                                   ? "this chat is open in " + root.chatHeld
+                                     + " - Hermes allows one writer"
+                                   : (root.chatPending
+                                      ? "waiting for the bot…"
+                                      : "message @" + (root.chat ? root.chat.bot : ""))
+                  color: root.fg
+                  placeholderTextColor: root.faint
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  selectByMouse: true
+                  background: Rectangle {
+                    color: "transparent"
+                    border.color: chatInput.activeFocus ? root.divider : root.faint
+                    border.width: 1
+                    radius: 2
+                  }
+                  onAccepted: root.sendChat()
+                  Keys.onEscapePressed: root.pickerOpen ? root.closePicker() : root.closeChat()
+                  onVisibleChanged: if (visible) chatFocus.restart()
+                }
+
+                // Enter, in a frame of its own: it is the one control in this window,
+                // so it should look like a control.
+                Rectangle {
+                  id: sendButton
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Style.space(48)
+                  height: Style.space(26)
+                  radius: 3
+                  color: sendArea.containsMouse && !root.chatPending && root.chatHeld === ""
+                         ? root.hilite : "transparent"
+                  border.width: 1
+                  border.color: root.chatPending || root.chatHeld !== "" ? root.faint : root.divider
+                  opacity: root.chatPending || root.chatHeld !== "" ? 0.45 : 1
+                  Text {
+                    anchors.centerIn: parent
+                    textFormat: Text.PlainText
+                    text: "⏎ send"
+                    color: root.fg
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                  MouseArea {
+                    id: sendArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: !root.chatPending && root.chatHeld === ""
+                    onClicked: root.sendChat()
+                  }
+                }
+              }
+
+              // The way out of a held chat, in one click: the bot's own Bot Chat is
+              // the one conversation nothing else holds.
+              Text {
+                width: parent.width
+                visible: root.chatHeld !== "" && root.canSwitchToBotChat()
+                textFormat: Text.PlainText
+                topPadding: Style.space(3)
+                text: "→ talk in @" + (root.chat ? root.chat.bot : "")
+                      + "'s own Bot Chat instead"
+                color: switchArea.containsMouse ? root.fg : root.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                MouseArea {
+                  id: switchArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.switchToBotChat()
+                }
+              }
+
+              // ---- whatever went wrong, in the agent's own words
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                visible: root.chatError !== ""
+                topPadding: Style.space(2)
+                text: root.chatError
+                color: root.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              // ---- the file browser, unfolding downward under the box
+              Item {
+                id: browserView
+                width: parent.width
+                visible: root.pickerOpen
+                height: visible ? browserBody.implicitHeight : 0
+
+                Column {
+                  id: browserBody
+                  width: parent.width
+                  spacing: 0
+
+                  Rectangle { width: parent.width; height: 1; color: root.faint }
+
+                  // where we are, and the way up
+                  Item {
+                    width: parent.width
+                    height: Style.space(28)
+                    Text {
+                      anchors.left: parent.left
+                      anchors.verticalCenter: parent.verticalCenter
+                      textFormat: Text.PlainText
+                      text: "‹ up"
+                      color: root.pickerParent !== "" ? root.dim : root.faint
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -Style.space(5)
+                        enabled: root.pickerParent !== ""
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.browseTo(root.pickerParent)
+                      }
+                    }
+                    Text {
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      width: parent.width - Style.space(70)
+                      horizontalAlignment: Text.AlignRight
+                      elide: Text.ElideLeft
+                      textFormat: Text.PlainText
+                      text: root.pickerDir
+                      color: root.faint
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  Rectangle { width: parent.width; height: 1; color: root.faint }
+
+                  Flickable {
+                    id: listing
+                    width: parent.width
+                    height: Style.space(280)
+                    contentWidth: width
+                    contentHeight: files.implicitHeight + Style.space(8)
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+                    flickableDirection: Flickable.VerticalFlick
+                    interactive: contentHeight > height
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                    Column {
+                      id: files
+                      x: Style.space(4)
+                      width: parent.width - Style.space(8)
+                      topPadding: Style.space(4)
+                      spacing: Style.space(1)
+
+                      Text {
+                        width: parent.width
+                        textFormat: Text.PlainText
+                        visible: root.pickerEntries.length === 0 && root.pickerError === ""
+                        text: "nothing here"
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                      Text {
+                        width: parent.width
+                        textFormat: Text.PlainText
+                        wrapMode: Text.Wrap
+                        visible: root.pickerError !== ""
+                        text: root.pickerError
+                        color: root.urgent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+
+                      Repeater {
+                        model: root.pickerEntries
+
+                        Item {
+                          id: entryRow
+                          required property var modelData
+                          required property int index
+                          width: files.width
+                          height: Style.space(20)
+
+                          Rectangle {
+                            anchors.fill: parent
+                            anchors.leftMargin: -Style.space(4)
+                            anchors.rightMargin: -Style.space(4)
+                            color: entryArea.containsMouse ? root.hilite : "transparent"
+                          }
+                          Row {
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: Style.space(6)
+                            Text {
+                              textFormat: Text.PlainText
+                              text: entryRow.modelData.dir ? "▸" : " "
+                              color: root.accent
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption
+                            }
+                            Text {
+                              textFormat: Text.PlainText
+                              text: entryRow.modelData.name + (entryRow.modelData.dir ? "/" : "")
+                              color: entryRow.modelData.dir ? root.fg : root.dim
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.bodySmall
+                              elide: Text.ElideMiddle
+                              width: Math.min(implicitWidth, files.width - Style.space(96))
+                            }
+                            Text {
+                              textFormat: Text.PlainText
+                              visible: !entryRow.modelData.dir
+                              text: root.humanSize(entryRow.modelData.size)
+                              color: root.faint
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption
+                            }
+                          }
+                          MouseArea {
+                            id: entryArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.pickEntry(entryRow.modelData)
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
           // ---- rows
           Repeater {
             id: repeater
@@ -978,7 +2480,12 @@ Panel {
               required property var modelData
               required property int index
               width: column.width
-              height: modelData.kind === "section" || modelData.kind === "pinnedHeader" ? Style.space(26)
+              // The roster stands down while a conversation is open. A Repeater
+              // parents its delegates to its PARENT, not to itself, so hiding the
+              // Repeater would not have hidden these.
+              visible: root.chat === null
+              height: !visible ? 0
+                    : modelData.kind === "section" || modelData.kind === "pinnedHeader" ? Style.space(26)
                     : modelData.kind === "pinnedAgent" ? Style.space(20)
                     : modelData.kind === "attach" || modelData.kind === "pinned" ? Style.space(26)
                     : modelData.kind === "rule" ? Style.space(13) : Style.space(46)
@@ -1297,7 +2804,7 @@ Panel {
           // ---- empty states
           Text {
             textFormat: Text.PlainText
-            visible: root.snap && root.bots.length === 0
+            visible: root.snap && root.bots.length === 0 && root.chat === null
             width: parent.width
             topPadding: Style.space(10)
             text: "no bots in this Hermes install yet"
@@ -1306,45 +2813,61 @@ Panel {
             font.pixelSize: Style.font.bodySmall
           }
 
-          Rectangle { width: parent.width; height: 1; color: root.faint; visible: root.bots.length > 0 }
+          Rectangle { width: parent.width; height: 1; color: root.faint; visible: root.bots.length > 0 && root.chat === null }
 
 
           // ---- footer
+          // Two lines, not one. The list of keys is longer than the card is wide, and
+          // a single line could only ever be elided. The split is by ROLE: what you
+          // press to act, and what the panel is currently set to - so the second line
+          // doubles as a readout. The keys are bolded so the eye finds them, and `h`
+          // is gone: it was advertised here and had no handler anywhere.
           Item {
             id: footer
             width: parent.width
-            height: Style.space(30)
-            // The hint has to fit the narrowest card the panel can be, in every
-            // theme font size, so it steps down through three wordings and only
-            // then elides. One fixed wording runs past the card edge.
-            readonly property string hintFull: "j/k move · ⏎ open · g " + root.ordering
-                                               + " · p pinned · s " + root.source + " · h hide · r beside mark: " + root.barMetric
-            readonly property string hintMedium: "j/k · ⏎ open · g " + root.ordering
-                                                 + " · p pinned · s " + root.source + " · h hide · r mark: " + root.barMetric
-            readonly property string hintShort: "j/k · ⏎ open · g " + root.ordering
-                                                + " · p · s · h hide · r " + root.barMetric
-            TextMetrics {
-              id: hintFullMetrics
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              text: footer.hintFull
-            }
-            TextMetrics {
-              id: hintMediumMetrics
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              text: footer.hintMedium
-            }
-            Text {
-              textFormat: Text.PlainText
+            visible: root.chat === null
+            height: visible ? Style.space(30) : 0
+
+            // Values here are our own enum settings, never user content, so this line
+            // may carry markup. The transcript never does.
+            readonly property string actLine: "<b>j/k</b> move · <b>⏎</b> open · <b>o</b> desktop · <b>n</b> new "
+                                              + (root.newBot !== "" ? root.newBot : "chat")
+            readonly property string showLine: "<b>g</b> " + root.ordering + " · <b>p</b> pinned · <b>s</b> "
+                                               + root.source + " · <b>r</b> " + root.barMetric
+
+            // The two lines are centred as a block and within themselves, so the
+            // footer reads as a caption under the card rather than a column of
+            // left-hugging text. The width follows the longer line, clamped to the
+            // card, so a narrow theme still elides instead of overflowing.
+            Column {
+              anchors.horizontalCenter: parent.horizontalCenter
               anchors.verticalCenter: parent.verticalCenter
-              width: parent.width
-              elide: Text.ElideRight
-              text: hintFullMetrics.advanceWidth <= width ? footer.hintFull
-                    : (hintMediumMetrics.advanceWidth <= width ? footer.hintMedium : footer.hintShort)
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
+              width: Math.min(Math.max(actText.implicitWidth, showText.implicitWidth),
+                              parent.width)
+              spacing: Style.space(1)
+
+              Text {
+                id: actText
+                textFormat: Text.RichText
+                width: parent.width
+                horizontalAlignment: Text.AlignHCenter
+                elide: Text.ElideRight
+                text: footer.actLine
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+              Text {
+                id: showText
+                textFormat: Text.RichText
+                width: parent.width
+                horizontalAlignment: Text.AlignHCenter
+                elide: Text.ElideRight
+                text: footer.showLine
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
             }
           }
         }

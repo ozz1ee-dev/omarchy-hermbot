@@ -5,10 +5,10 @@ the newest thing it said, and one click to it.
 
 ![Hermbot in the bar and its panel](preview.png)
 
-Both screenshots are the widget's own demo roster (`omarchy-shell ozz1ee.hermbot
-demo`), so every part of it is visible at once - the bots, the session under
-each one, the pinned section. Your own roster replaces them the moment the panel
-opens.
+Everything below is the widget's own demo roster (`omarchy-shell ozz1ee.hermbot
+demo`), so every part of it is visible at once - the bots, the session under each
+one, the pinned section, and a staged conversation. Your own roster replaces it
+the moment the panel opens.
 
 A bot is a Hermes profile. There is no second source of truth here: the widget
 reads the same files the desktop writes (`profile.yaml`'s `ui_meta['hermes-bots']`
@@ -38,9 +38,53 @@ drawing engine is Rakabot's, adapted - see `NOTICE` for the lineage.
 | Pinned chats, grouped by the bot they belong to | yes (`p` hides the section, the choice is saved) |
 | Follow Hermes Desktop to another host (SSH connection) | yes (`s` toggles auto/local; the header names the instance) |
 | Desktop notification when a bot writes, click opens that bot | yes |
-| Send a message into a bot's canonical Bot Chat | via `bin/hermbot-send` (the panel has no input, as in Rakabot) |
-| Open Hermes on the bot's most recent conversation | yes |
-| Open Hermes directly on the bot's **canonical Bot Chat** | waiting on upstream: PR [#115195](https://github.com/NousResearch/hermes-agent/pull/115195) adds `hermes://bot/<profile>`, verified live from this widget's side - until it ships, a click opens the bot's most recently active visible session |
+| Talk to a bot from the panel itself, without Hermes Desktop | yes - a chat window in the panel, `n` on a bot (see below) |
+| See how the bot got there: its thinking, every tool call, what came back | yes, live while the turn runs and from the session store afterwards (`w` folds it away) |
+| Attach files to a turn, with an image preview | yes - an in-panel file browser and a chip per file |
+| Send a message into a bot's canonical Bot Chat | the panel's own chat window, or `bin/hermbot-send` from a terminal |
+| Open Hermes on the bot's most recent conversation | yes (`o`, or the bot row's own key) |
+| Open Hermes directly on the bot's **canonical Bot Chat** | waiting on upstream: PR [#115195](https://github.com/NousResearch/hermes-agent/pull/115195) adds `hermes://bot/<profile>`, verified live from this widget's side - until it ships, `o` opens the bot's most recently active visible session |
+
+## Talking to a bot from the panel
+
+A bot row opens a **chat window inside the panel**: the roster gives way to the
+conversation and you talk to that bot with Hermes Desktop not involved at all.
+`n` starts a fresh chat with the bot under the cursor, `Esc` goes back, and the
+header names the bot you are talking to - a key that opened a conversation with
+somebody the panel never mentioned would be worse than no key.
+
+![The panel, on the demo roster](docs/panel.png)
+
+**The bot's work is in the stream.** Alongside what it said you get how it got
+there: `thinking` blocks, one line per tool call (`terminal: ls -la /tmp`) and
+one per result, errors included. It arrives **live while the turn runs** - the
+answer lands in one piece, but the call that produced it appears seconds earlier,
+which is the difference between watching it work and staring at a spinner - and
+the same detail is read back from the session store afterwards. `w`, or the
+`stream on` / `stream off` label in the header, folds it away for a plain
+conversation; the choice is saved.
+
+![The chat window, with the bot's work in the stream](docs/chat.png)
+
+**Attach files, with a real preview.** `+` opens a file browser *inside the panel*
+- not a separate chooser, which on this compositor would land underneath the
+panel and lose focus the moment you switched to it - and what you pick becomes a
+chip above the input, with a thumbnail when it is an image.
+
+![The in-panel file browser](docs/files.png)
+![A file attached, with its preview](docs/attach.png)
+
+The turn is handed to Hermes the way the desktop hands it over, as `@file:` and
+`@image:` references in the message, so nothing is re-implemented on this side:
+the text travels through `--query-file`, no shell is involved anywhere, and every
+process is spawned as argv.
+
+**One writer per session, and the panel respects it.** Hermes allows a single
+writer per session, and Hermes Desktop holds that lease while a chat is open
+there. A bot row therefore talks in the bot's own canonical **Bot Chat** - the
+conversation the desktop keeps out of its sidebar, so nothing else holds it -
+while a session row that targets a chat the desktop has open says so in the window
+instead of failing silently.
 
 ## Keys, mouse and IPC
 
@@ -50,15 +94,25 @@ With the panel open (click the mark, or `omarchy-shell ozz1ee.hermbot toggle`):
 |---|---|
 | `j` / `k` | move down / up through the rows (bots, the session under each, pinned chats) |
 | `Enter` | open the row under the cursor |
+| `n` | start a new chat with the bot under the cursor, in the panel's chat window |
+| `o` | open the row in Hermes Desktop |
 | `g` | cycle the panel order (`attention` -> `gateway` -> `flat`), saved |
 | `p` | show or hide the PINNED section, saved |
 | `s` | follow the app (`auto`) or this machine (`local`), saved |
 | `r` | cycle what the bar draws beside the mark (`avatars` -> `count` -> `none`), saved |
-| `h` | hide the panel |
+
+In the chat window:
+
+| key | does |
+|---|---|
+| `Esc` | close the file browser when it is open, else go back to the roster |
+| `w` | show or hide the bot's work in the stream, saved |
 
 On the bar entry: left click opens the panel, middle click cycles the bar metric,
 right click opens the bot at the top of the roster - the one that wants you most.
-The footer of the panel spells the keys out, shortening as the panel narrows.
+The panel's footer spells the keys out on two lines: first what you press to act,
+then what the panel is currently set to - so the second line doubles as a readout
+of the order, the source and what the bar draws.
 
 Everything the panel does can be driven without a keyboard, which is how it is
 tested and how the screenshots above were taken:
@@ -72,10 +126,14 @@ tested and how the screenshots above were taken:
 | `omarchy-shell ozz1ee.hermbot order flat` | set the order outright (`attention`, `gateway`, `flat`) |
 | `omarchy-shell ozz1ee.hermbot geometry` | the panel's rectangle in logical pixels, for a screenshot crop |
 | `omarchy-shell ozz1ee.hermbot look 120 340` / `away` | aim the avatars' eyes at a point, e.g. while recording |
+| `omarchy-shell ozz1ee.hermbot chatState` | what the chat window is showing, and whether the panel is up, as one JSON line |
+| `omarchy-shell ozz1ee.hermbot newChat` / `closeChat` | the same calls `n` and `Esc` make, so the key and the function can be told apart |
+| `omarchy-shell ozz1ee.hermbot openThread <session-id>` | open one exact session in the chat window |
+| `omarchy-shell ozz1ee.hermbot picker [dir]` / `attach <path>` | stage the file browser and an attachment, which a probe otherwise cannot click |
 
 ## Settings
 
-Six settings, all in the bar's own settings UI (`omarchy bar`). Every one a key
+Seven settings, all in the bar's own settings UI (`omarchy bar`). Every one a key
 cycles is written back through `omarchy bar set`, so the choice survives a
 restart and a plugin update.
 
@@ -85,6 +143,7 @@ restart and a plugin update.
 | `maxBarAvatars` | `3` | how many faces beside the mark, at most (1-6) |
 | `ordering` | `attention` | panel order: `attention` puts the bots that want you first, longest wait at the top, then a rule and everyone else by recency; `gateway` groups by what the gateway serves and what it does not; `flat` is pure recency |
 | `showPinned` | `true` | the PINNED section, grouped by the bot each chat belongs to |
+| `showWork` | `true` | whether the chat window shows the bot's **stream** - its thinking, every tool call and what came back - or a plain conversation. Live while the turn runs and from the session store afterwards; the header reads `stream on` / `stream off` |
 | `source` | `auto` | which instance to read: `auto` follows Hermes Desktop's own connection, `local` always reads this machine |
 | `notifyOnMessage` | `true` | an Omarchy card when a bot writes, with a click that opens that bot - transitions only, at most one card per bot |
 
@@ -175,6 +234,20 @@ hermbot-watch [--once] [--pretty] [--notify] [--interval SECONDS]
               [--source auto|local|ssh:<id|host>] [--hermes-root DIR]
               [--appdata DIR] [--state FILE] [--seen FILE] [--mark-seen NAME]
 ```
+
+Three more modes answer one question each and exit, and they are what the panel's
+chat window runs:
+
+```bash
+hermbot-watch --thread SESSION_ID [--limit N] [--work]  # one conversation, as JSON
+hermbot-watch --ls DIR                                  # one directory, as JSON
+hermbot-watch --find-title TITLE [--bot NAME]           # newest session with that exact title
+```
+
+`--work` adds the bot's thinking, its tool calls and their results to the
+conversation; without it `--thread` prints only what was said. `--ls` backs the
+in-panel file browser - directories first, dotfiles left out, because a wall of
+`.cache` at every level is noise in a narrow column.
 
 ```bash
 hermbot-watch --once --pretty      # one snapshot, human readable
@@ -289,18 +362,24 @@ Says something to a bot, into its canonical Bot Chat - the same conversation the
 desktop, the CLI and the bot-to-bot `message_agent` tool use.
 
 ```bash
-hermbot-send --bot NAME [--text TEXT] [--wait] [--print] [--json]
+hermbot-send --bot NAME [--text TEXT] [--session ID] [--title NAME]
+             [--image PATH] [--wait | --stream] [--print] [--json]
 ```
 
 ```bash
-hermbot-send --bot dev "status?"    # detached: the reply arrives as a card
+hermbot-send --bot dev --text "status?"   # detached: the reply arrives as a card
 echo "long text" | hermbot-send --bot web
-hermbot-send --bot dev --wait "ping"  # foreground, prints the reply
+hermbot-send --bot dev --wait --text "ping"  # foreground, prints the reply
 ```
 
-Text comes from `--text` or stdin. `--wait` runs it in the foreground and prints
-the reply instead of letting the answer come back as a notification card;
-`--print` shows the command it would run and `--json` the result.
+Text comes from `--text` or stdin. `--session` delivers into one exact session
+instead of the bot's canonical Bot Chat, and `--title` creates a chat of that name
+when there is no session yet - the panel's chat window uses both, and it is why a
+new chat's title carries seconds: a chat is created by name, so two "Hermbot 17:46"
+in the same minute would resume each other instead of starting fresh. `--stream`
+runs in the foreground and emits the turn as `stream-json` lines, which is what the
+chat window shows live while the bot works; `--image` attaches a local image the
+model can see. `--print` shows the command it would run and `--json` the result.
 
 The delivery door is the one Hermes itself uses for bot-to-bot DMs:
 `hermes -p <bot> chat --in ~ -c "Bot Chat" --create-if-missing -Q --query-file <file>`,
@@ -339,8 +418,10 @@ branch rather than a release.
    supported.
 2. Flip the click to the **canonical Bot Chat** the day `hermes://bot/<profile>`
    ships in a released desktop (`HERMBOT_DESKTOP_BIN` already lets the door be
-   tested against a build from a branch).
-3. Marketplace submission.
+   tested against a build from a branch). A bot row already talks in that chat -
+   inside the panel - so what is missing is only the desktop's own door to it.
+3. Marketplace submission: done - Hermbot is listed in the Omarchy plugin
+   catalogue.
 
 ## Development
 
@@ -366,8 +447,15 @@ python3 scripts/check-portability.py && python3 scripts/check-manifest.py .
 ```
 
 To look at the widget without touching your own roster, `omarchy-shell
-ozz1ee.hermbot demo` switches both the bar and the panel to the demo bots, and
-the same command switches back. Release history is in `CHANGELOG.md`.
+ozz1ee.hermbot demo` switches the bar, the panel and the chat window to staged
+data, and the same command switches back. The demo roster's sessions are in no
+store, so demo mode stages the conversation too rather than showing an empty
+window - which is how every screenshot in this file was taken, on an empty
+workspace, with the panel cropped to itself.
+
+![The bar on the demo roster](docs/bar-demo.png)
+
+Release history is in `CHANGELOG.md`.
 
 ## License
 

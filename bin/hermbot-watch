@@ -613,6 +613,346 @@ def latest_message(con, session_id):
     return ("", None, None)
 
 
+def unwrap_content(content):
+    """The text of a message, with its own line breaks kept.
+
+    Some rows carry a JSON envelope (a content-parts list, or a {"text": ...}
+    object) instead of a bare string. latest_message only ever needs one line, so
+    it collapses whitespace; a chat window needs the real thing, so this unwraps
+    and otherwise leaves the text alone.
+    """
+    text = content
+    if isinstance(text, str) and text.lstrip().startswith(("{", "[")):
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            text = parsed.get("text") or parsed.get("content") or ""
+        elif isinstance(parsed, list):
+            text = "".join(
+                part.get("text", "")
+                for part in parsed
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+    if not isinstance(text, str):
+        return ""
+    return text.replace("\r\n", "\n").strip()
+
+
+def tool_calls_in(raw):
+    """One line per call the assistant asked for, e.g. 'terminal · ls -la /tmp'."""
+    if not raw:
+        return []
+    try:
+        calls = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(calls, list):
+        return []
+    out = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+        name = str(fn.get("name") or call.get("name") or "tool")
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                args = None
+        hint = ""
+        if isinstance(args, dict):
+            # The interesting argument differs per tool; these cover the ones that
+            # say what the call is actually about.
+            for key in ("command", "path", "file_path", "query", "pattern", "url",
+                        "prompt", "text", "name"):
+                value = args.get(key)
+                if isinstance(value, str) and value.strip():
+                    hint = " ".join(value.split())
+                    break
+            if not hint:
+                for value in args.values():
+                    if isinstance(value, str) and value.strip():
+                        hint = " ".join(value.split())
+                        break
+        out.append(name + ((" · " + hint[:130]) if hint else ""))
+    return out
+
+
+def tool_summary(name, content):
+    """'terminal · 22 files' - a tool result in one line, error first if there is one."""
+    raw = content if isinstance(content, str) else ""
+    text = ""
+    if raw.lstrip().startswith("{"):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            if parsed.get("error"):
+                text = "error: " + str(parsed["error"])
+            else:
+                text = str(parsed.get("output") or parsed.get("text") or "")
+    if not text:
+        text = unwrap_content(content)
+    first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    return str(name or "tool") + ((" · " + first[:150]) if first else "")
+
+
+def thread_turns(con, session_id, limit=60, work=False):
+    """The conversation, oldest first - the turns a chat window draws.
+
+    Without `work`, only user/assistant text with real content: tool plumbing, and
+    the empty assistant rows that merely carry tool calls, are not conversation.
+    With `work`, the same window also carries what the bot did to get there - the
+    thinking, each call it made and what came back - because that is what the
+    desktop shows and it is the difference between watching it work and waiting.
+    """
+    if work:
+        sql = ("SELECT id, role, tool_name, content, reasoning, tool_calls, timestamp"
+               " FROM messages WHERE session_id = ? AND (active IS NULL OR active = 1)"
+               " ORDER BY id DESC LIMIT ?")
+    else:
+        sql = ("SELECT id, role, NULL, content, NULL, NULL, timestamp"
+               " FROM messages WHERE session_id = ? AND role IN ('user', 'assistant')"
+               " AND content IS NOT NULL AND content != ''"
+               " AND (active IS NULL OR active = 1)"
+               " ORDER BY id DESC LIMIT ?")
+    try:
+        rows = con.execute(sql, (session_id, int(limit))).fetchall()
+    except sqlite3.Error:
+        return []
+    rows.reverse()
+    out = []
+    for _mid, role, tool_name, content, reasoning, tool_calls, ts in rows:
+        stamp = as_float(ts) or 0
+        if role == "user":
+            text = unwrap_content(content)
+            if text:
+                out.append({"role": "user", "text": text, "ts": stamp})
+        elif role == "assistant":
+            if work and reasoning:
+                think = unwrap_content(reasoning)
+                if think:
+                    out.append({"role": "think", "text": think, "ts": stamp})
+            if work:
+                for call in tool_calls_in(tool_calls):
+                    out.append({"role": "call", "text": call, "ts": stamp})
+            text = unwrap_content(content)
+            if text:
+                out.append({"role": "bot", "text": text, "ts": stamp})
+        elif role == "tool" and work:
+            out.append({"role": "result", "text": tool_summary(tool_name, content), "ts": stamp})
+    return out
+
+
+def session_holder(home, session_id):
+    """The surface holding a lease on this session, or '' when it is free.
+
+    Hermes allows exactly ONE writer per session and the holder refuses a second
+    outright, so the window has to know before you type rather than after a send
+    that silently went nowhere. The registry sits beside the profile's own runtime
+    state - the desktop writes it when it opens a chat and drops the entry when it
+    lets go.
+    """
+    path = Path(home) / "runtime" / "active_sessions.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    entries = data.get("entries") if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        return ""
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("session_id") or "") == str(session_id):
+            return str(entry.get("surface") or "another surface")
+    return ""
+
+
+def find_session(root, session_id):
+    """(profile name, home, connection) for the profile whose store holds this session.
+
+    A chat window is opened with a session id and nothing else, and the id does not
+    say which bot it belongs to - so the store that owns it is the answer.
+    """
+    for name, home in bot_homes(root):
+        con = open_store(home)
+        if con is None:
+            continue
+        try:
+            row = con.execute("SELECT id FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        except sqlite3.Error:
+            row = None
+        if row:
+            return name, home, con
+        con.close()
+    return None, None, None
+
+
+def thread_payload(root, session_id, limit=60, work=False):
+    """One conversation, as the chat window needs it."""
+    name, home, con = find_session(root, session_id)
+    if con is None:
+        return {"kind": "thread", "session_id": session_id, "bot": None,
+                "error": "no profile on this machine holds that session", "turns": []}
+    try:
+        meta = con.execute(
+            "SELECT title, hidden, message_count FROM sessions WHERE id = ?",
+            (session_id,)).fetchone()
+        turns = thread_turns(con, session_id, limit, work)
+    except sqlite3.Error:
+        meta, turns = None, []
+    finally:
+        con.close()
+    return {
+        "kind": "thread",
+        "session_id": session_id,
+        "bot": name,
+        "title": meta[0] if meta else None,
+        "hidden": bool(meta[1]) if meta else False,
+        "message_count": as_int(meta[2]) if meta else 0,
+        "work": bool(work),
+        "held": session_holder(home, session_id),
+        "turns": turns,
+    }
+
+
+def ls_payload(target_dir, limit=400):
+    """One directory, as the in-panel file browser needs it.
+
+    Dirs come first and dotfiles are left out: this is a picker for something you
+    want to attach, not a replacement for a real file manager, and a wall of
+    .cache/.git/.config at every level is noise in a 640px column.
+    """
+    raw = str(target_dir or "").strip()
+    path = Path(os.path.expanduser(raw)) if raw else Path.home()
+    out = {"kind": "ls", "dir": str(path), "parent": "", "entries": [], "error": ""}
+    try:
+        path = path.resolve()
+    except OSError:
+        pass
+    out["dir"] = str(path)
+    out["parent"] = str(path.parent) if path.parent != path else ""
+    try:
+        if not path.is_dir():
+            out["error"] = "not a directory"
+            return out
+        found = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except OSError as exc:
+        out["error"] = str(exc)[:140]
+        return out
+    for entry in found:
+        if entry.name.startswith("."):
+            continue
+        if len(out["entries"]) >= int(limit):
+            break
+        try:
+            is_dir = entry.is_dir()
+            size = 0 if is_dir else entry.stat().st_size
+        except OSError:
+            continue
+        out["entries"].append({"name": entry.name, "path": str(entry),
+                               "dir": is_dir, "size": size})
+    return out
+
+
+def ssh_oneshot(target, remote_args):
+    """(stdout, error) for one ssh call that runs THIS script on the other machine."""
+    try:
+        proc = subprocess.run(ssh_argv(target, remote_args), input=_remote_payload(),
+                              capture_output=True, text=True, timeout=45)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"ssh failed: {exc}"
+    if proc.stdout.strip():
+        return proc.stdout.strip(), None
+    return None, (proc.stderr or "the other machine answered nothing").strip()[:200]
+
+
+def _remote_root_args(args):
+    """The root is only worth passing when it was named explicitly: the other
+    machine's home is its own."""
+    if str(args.hermes_root) != str(DEFAULT_ROOT):
+        return ["--hermes-root", str(args.hermes_root)]
+    return []
+
+
+def ssh_thread(args, target):
+    """One conversation from another machine."""
+    remote_args = ["--thread", str(args.thread), "--limit", str(args.limit)] + _remote_root_args(args)
+    if getattr(args, "work", False):
+        remote_args.append("--work")
+    stdout, error = ssh_oneshot(target, remote_args)
+    if stdout:
+        print(stdout)
+        return 0
+    print(json.dumps({"kind": "thread", "session_id": args.thread, "bot": None,
+                      "error": error, "turns": []}, ensure_ascii=False))
+    return 1
+
+
+def ssh_ls(args, target):
+    """One directory listing from another machine."""
+    remote_args = ["--ls", str(args.ls), "--limit", str(args.limit)] + _remote_root_args(args)
+    stdout, error = ssh_oneshot(target, remote_args)
+    if stdout:
+        print(stdout)
+        return 0
+    print(json.dumps({"kind": "ls", "dir": str(args.ls), "parent": "", "entries": [],
+                      "error": error}, ensure_ascii=False))
+    return 1
+
+
+def find_by_title(root, title, bot=None):
+    """The newest session carrying this exact title, and the profile holding it.
+
+    A chat is created by its first message - there is no "make an empty session"
+    command - so its id only exists afterwards. This is how the window learns which
+    conversation it just started.
+    """
+    want = str(title or "").strip()
+    if not want:
+        return None
+    best = None
+    for name, home in bot_homes(root):
+        if bot and name != bot:
+            continue
+        con = open_store(home)
+        if con is None:
+            continue
+        try:
+            row = con.execute(
+                "SELECT id, title, message_count FROM sessions WHERE title = ?"
+                " ORDER BY id DESC LIMIT 1", (want,)).fetchone()
+        except sqlite3.Error:
+            row = None
+        finally:
+            con.close()
+        if row:
+            found = {"bot": name, "session_id": row[0], "title": row[1],
+                     "message_count": as_int(row[2])}
+            # Ids are timestamps, so the largest is the newest across profiles.
+            if best is None or str(found["session_id"]) > str(best["session_id"]):
+                best = found
+    return best
+
+
+def ssh_find_title(args, target):
+    """A title lookup on another machine."""
+    remote_args = ["--find-title", str(args.find_title)] + _remote_root_args(args)
+    if args.bot:
+        remote_args += ["--bot", str(args.bot)]
+    stdout, error = ssh_oneshot(target, remote_args)
+    if stdout:
+        print(stdout)
+        return 0
+    print(json.dumps({"kind": "found", "error": error}, ensure_ascii=False))
+    return 1
+
+
 def attach_session(con, read_state=None, profile=None):
     """The session to hang off a bot's row, and how it is labelled.
 
@@ -1663,11 +2003,46 @@ def main(argv=None):
                     help="auto = follow Hermes Desktop's own connection; local; or ssh:<id|host>")
     ap.add_argument("--appdata", default=None,
                     help="Hermes Desktop's state directory (default ~/.config/Hermes)")
+    ap.add_argument("--thread", metavar="SESSION_ID",
+                    help="print one conversation as JSON and exit (for a chat window)")
+    ap.add_argument("--limit", type=int, default=60,
+                    help="how many turns --thread prints (default 60)")
+    ap.add_argument("--ls", metavar="DIR", default=None,
+                    help="print one directory listing as JSON and exit (for the file browser)")
+    ap.add_argument("--work", action="store_true",
+                    help="with --thread: also carry the bot's thinking, its calls and tool results")
+    ap.add_argument("--find-title", metavar="TITLE", default=None,
+                    help="print the newest session with this exact title and exit")
+    ap.add_argument("--bot", default=None, help="limit --find-title to one profile")
     args = ap.parse_args(argv)
 
     if args.mark_seen:
         mark_seen(args.seen, args.mark_seen.lstrip("@").strip())
         return 0
+
+    if args.thread:
+        kind, target = source_of(args)
+        if kind == "ssh":
+            return ssh_thread(args, target)
+        payload = thread_payload(Path(args.hermes_root), args.thread, args.limit, args.work)
+        print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
+        return 0
+
+    if args.ls is not None:
+        kind, target = source_of(args)
+        if kind == "ssh":
+            return ssh_ls(args, target)
+        payload = ls_payload(args.ls, args.limit)
+        print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
+        return 0
+
+    if args.find_title is not None:
+        kind, target = source_of(args)
+        if kind == "ssh":
+            return ssh_find_title(args, target)
+        found = find_by_title(Path(args.hermes_root), args.find_title, args.bot)
+        print(json.dumps({"kind": "found", **(found or {})}, ensure_ascii=False))
+        return 0 if found else 1
 
     while True:
         kind, target = source_of(args)

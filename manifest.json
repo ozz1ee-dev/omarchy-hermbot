@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "ozz1ee.hermbot",
   "name": "Hermbot",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "author": "ozz1ee",
   "license": "Apache-2.0",
-  "description": "Your Hermes Bot Mode roster in the bar: every bot drawn as its own avatar, the newest thing it said, and one click to reach it.",
+  "description": "Your Hermes Bot Mode roster in the bar: every bot drawn as its own avatar, the newest thing it said, and a chat window to talk to it without leaving the bar.",
   "kinds": [
     "bar-widget"
   ],
@@ -29,6 +29,7 @@
       "notifyOnMessage": true,
       "ordering": "attention",
       "showPinned": true,
+      "showWork": true,
       "source": "auto"
     },
     "schema": [
@@ -79,6 +80,13 @@
         "label": "Show pinned chats",
         "defaultValue": true,
         "description": "A PINNED section under the bot list, grouped by the bot each chat belongs to - the same chats Hermes Desktop shows pinned, and each one a click away. The p key flips it and the choice is saved."
+      },
+      {
+        "key": "showWork",
+        "type": "boolean",
+        "label": "Show the bot's stream in the chat window",
+        "defaultValue": true,
+        "description": "The chat window shows not only what a bot said but how it got there: its thinking, every tool it reached for, and what came back - the same detail Hermes Desktop shows, live while the turn runs and from the session store afterwards. The chat header reads stream on / stream off. Off leaves a plain conversation. The w key flips it and the choice is saved."
       },
       {
         "key": "source",

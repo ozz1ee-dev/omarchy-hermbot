@@ -52,18 +52,50 @@ def resolve(name):
     raise RuntimeError(f"no bot named {name!r} in the roster")
 
 
-def command_for(bot, query_file):
+def resolve_title(title, bot):
+    """The id of a chat by its exact title, or '' - asked of the watcher, which owns
+    the store access. A chat is created by its first message, so its id only exists
+    after that message has been delivered."""
+    try:
+        out = subprocess.run([str(WATCH), "--find-title", str(title), "--bot", str(bot)],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if out.returncode != 0 or not out.stdout.strip():
+        return ""
+    try:
+        return str(json.loads(out.stdout.strip().splitlines()[-1]).get("session_id") or "")
+    except (ValueError, AttributeError):
+        return ""
+
+
+def command_for(bot, query_file, session_id=None, stream=False, image=None, title=None):
+    """The command that delivers the message.
+
+    Default target is the bot's canonical "Bot Chat" - the forever-chat Hermes
+    itself DMs a bot in, shared by the desktop, the CLI and this widget. With
+    session_id the message goes into that exact thread instead, which is what a
+    chat window opened from a session row has to do: the conversation the user
+    picked is the conversation they type into, or the reply lands somewhere they
+    are not looking. With title (and no session_id) the message CREATES a chat of
+    that name - how the widget starts a fresh conversation of its own.
+    """
     cmd = ["hermes"]
     if bot["name"] != "default":
         cmd += ["-p", bot["name"]]
-    cmd += [
-        "chat",
-        "--in", str(Path.home()),
-        "-c", BOT_CHAT,
-        "--create-if-missing",
-        "-Q",
-        "--query-file", str(query_file),
-    ]
+    cmd += ["chat", "--in", str(Path.home())]
+    if session_id:
+        cmd += ["--resume", session_id]
+    else:
+        cmd += ["-c", str(title or BOT_CHAT), "--create-if-missing"]
+    if image:
+        cmd += ["--image", str(image)]
+    cmd += ["-Q"]
+    if stream:
+        # Incremental text events, so a chat window can print the reply as it is
+        # written instead of showing a spinner for the whole turn.
+        cmd += ["--format", "stream-json"]
+    cmd += ["--query-file", str(query_file)]
     return cmd
 
 
@@ -111,8 +143,16 @@ def write_query_file(text):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Send a message into a bot's canonical Bot Chat.")
     ap.add_argument("--bot", required=True, help="bot name (Hermes profile) or @handle")
+    ap.add_argument("--session", default=None,
+                    help="deliver into this exact session id instead of the canonical Bot Chat")
     ap.add_argument("--text", default=None, help="message text (default: read stdin)")
     ap.add_argument("--wait", action="store_true", help="run in the foreground and print the reply")
+    ap.add_argument("--stream", action="store_true",
+                    help="foreground, emit the turn as stream-json lines (for a chat window)")
+    ap.add_argument("--image", default=None,
+                    help="a local image path to attach to this turn (the model sees it)")
+    ap.add_argument("--title", default=None,
+                    help="create a chat of this name when --session is not given")
     ap.add_argument("--print", dest="dry_run", action="store_true", help="print the command instead of running it")
     ap.add_argument("--json", action="store_true", help="machine-readable result")
     args = ap.parse_args(argv)
@@ -127,14 +167,15 @@ def main(argv=None):
 
     prune_query_files()
     query_file = write_query_file(text)
-    cmd = command_for(bot, query_file)
+    cmd = command_for(bot, query_file, args.session, args.stream, args.image, args.title)
     result = {
         "bot": bot["name"],
-        "session_id": bot["chat"]["session_id"],
-        "created_chat": not bot["chat"]["exists"],
+        "session_id": args.session or bot["chat"]["session_id"],
+        "created_chat": bool(not bot["chat"]["exists"] and not args.session),
         "command": " ".join(cmd),
         "text_chars": len(text),
-        "mode": "wait" if args.wait else "detached",
+        "image": args.image,
+        "mode": "stream" if args.stream else ("wait" if args.wait else "detached"),
         "pid": None,
         "reply": None,
     }
@@ -149,6 +190,31 @@ def main(argv=None):
         return 0
 
     env = {**os.environ, "HERMBOT_SEND_FILE": str(query_file)}
+    if args.stream:
+        # Foreground with stdout INHERITED on purpose: the chat window parses the
+        # stream-json lines as they arrive, so this process must not capture or
+        # buffer them. The query file is unlinked only once the child is gone -
+        # removing it earlier is the race that kills a turn mid-read.
+        proc = subprocess.run(cmd, env=env, cwd=str(Path.home()))
+        result["exit_code"] = proc.returncode
+        try:
+            query_file.unlink()
+        except OSError:
+            pass
+        # A line of our own after the agent's stream: when this turn CREATED the
+        # chat, the caller has no way to know its id otherwise, and without it the
+        # window could never read back what it just wrote.
+        if args.title and not args.session:
+            created = resolve_title(args.title, bot["name"])
+            if created:
+                result["session_id"] = created
+                result["created_chat"] = True
+                print(json.dumps({"type": "hermbot", "session_id": created,
+                                  "title": args.title}, ensure_ascii=False))
+        log(f"{bot['name']}: stream finished rc={proc.returncode}")
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False))
+        return 0 if proc.returncode == 0 else 1
     if args.wait:
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(Path.home()))
         result["reply"] = (proc.stdout or "").strip()[-4000:]
