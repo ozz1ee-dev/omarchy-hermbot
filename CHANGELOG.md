@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.6.0
+
+- **The chat window resizes by its edges.** Grab the right edge, the bottom edge or the
+  bottom-right corner grip: the window grows around its own centre, because the panel surface centres
+  itself horizontally - one edge moves, both sides change. The transcript stops
+  re-wrapping while you drag and settles once you let go, so the drag stays smooth.
+- **Text size on `Ctrl+=` / `Ctrl+-`, `Ctrl+0` to put it back.** 75% to 180% in steps of
+  ten, the panel's inside only: the bar's label and avatar keep the theme's size, so
+  raising the text never disturbs the bar.
+- **A queued message drains itself.** Hermes allows one writer per session, so a message
+  typed while the bot is mid-turn is queued rather than refused. It used to wait for a
+  read to notice the chat was free, which could take as long as the turn; a pump of its
+  own now sends it within about a second of the lease being released.
+- **`held by CLI` clears when the turn ends, not when the process does.** The window read
+  the process registry, which lives as long as the process does - so a finished turn
+  could look busy for minutes. It reads the turn lease instead, which is deleted the
+  moment the turn ends.
+- **No send button.** Enter sends and Shift+Enter breaks the line, so the button only
+  ever duplicated the key your hand was already on, and it cost the field a strip of
+  width. The field is wider for it.
+- **A bigger window by default**, and `**bold**` and `code` in a reply are drawn as bold
+  and code rather than as asterisks and backticks.
+
+### Fixed
+
+- **The preview of an image you send.** Hermes records an attachment as a bracketed
+  `[Image attached at: ...]` line, which the window did not recognise: the raw path was
+  printed as if it were the message. It is read now, and drawn as the picture it is.
+- **An image path that cannot be loaded retried forever.** Ordinary message text that
+  happened to look like a path - a reply explaining the marker above, for instance - was
+  drawn as an image, and a failed load retries. The shell sat at 80-90% of a core with
+  the chat open, which is what made the window feel heavy. A path must now be absolute,
+  end in an image suffix, and the bracketed form is read from your turns only. A failed
+  load stops instead of retrying.
+- **The reply no longer appears twice while it streams.** The store can already carry a
+  prefix of a reply that is still arriving, and both copies were drawn - once with a
+  clock, once without. The stored copy is now hidden while the live text shows the same
+  words, instead of the live text being cleared: clearing it made the words vanish
+  mid-sentence and the view jump.
+- **The transcript is only rebuilt when it changed.** The pump reads about once a second,
+  and every read used to rebuild every row - which twitched the view and cost a layout of
+  the whole conversation. Measured over ten seconds: seven reads, zero rebuilds.
+- **Fewer rows drawn, and a collapsed work row lays out 4000 characters, not 90 000.**
+  The window held ~800 MB and half a core with a long conversation open; the drawn rows
+  are bounded now.
+
 ## 0.5.0
 
 - **You can talk to a bot from the panel now, with Hermes Desktop not involved.**

@@ -748,29 +748,143 @@ def thread_turns(con, session_id, limit=60, work=False):
     return out
 
 
-def session_holder(home, session_id):
-    """The surface holding a lease on this session, or '' when it is free.
+def _proc_start_time(pid):
+    """When a process started, in seconds since the epoch, or None if unreadable.
 
-    Hermes allows exactly ONE writer per session and the holder refuses a second
-    outright, so the window has to know before you type rather than after a send
-    that silently went nowhere. The registry sits beside the profile's own runtime
-    state - the desktop writes it when it opens a chat and drops the entry when it
-    lets go.
+    Read from /proc rather than psutil: the bar runs on a stock python3 and this is
+    the only reason psutil would be needed. The check it feeds is a comparison, not
+    a measurement, so the second of slop between btime and psutil's own clock is
+    harmless.
     """
-    path = Path(home) / "runtime" / "active_sessions.json"
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        boot = None
+        with open("/proc/stat", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("btime "):
+                    boot = float(line.split()[1])
+                    break
+        if boot is None:
+            return None
+        # The comm field can hold spaces and parentheses, so the split is on the
+        # LAST ")" - after it, field 3 (state) is elements[0] and field 22
+        # (starttime) is elements[19].
+        with open("/proc/%d/stat" % pid, "rb") as fh:
+            fields = fh.read().rsplit(b")", 1)[1].split()
+        return boot + float(fields[19]) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
+
+
+def _owner_alive(entry):
+    """Whether the process named by a lease entry is still running.
+
+    Hermes fences a session only while its holder is ALIVE - the entry exists to
+    keep two writers off one conversation, and a writer that is gone cannot write.
+    The registry is cleaned by the processes that use it, so an entry outlives its
+    owner when that owner is killed, crashes, or is torn down with the shell (the
+    window's own stream process is the easy case, and it is exactly the one that
+    leaves the chat saying "held by cli" forever - refusing the only writer left).
+
+    Unknown liveness counts as ALIVE: treating a live holder as gone would hand the
+    chat to a second writer, which Hermes refuses outright, so the safe error is a
+    message that queues for a moment.
+    """
+    try:
+        pid = int(entry.get("pid"))
+    except (TypeError, ValueError):
+        return True
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    expected = entry.get("process_start_time")
+    if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+        # (pid, start) is the identity Hermes itself compares: a recycled pid wears
+        # the same number with a different start time, and that is somebody else.
+        started = _proc_start_time(pid)
+        if started is not None and abs(started - float(expected)) > 5.0:
+            return False
+    return True
+
+
+def _lease_key_chain(con, session_id):
+    """``session_id`` plus its compression-parent ancestors, nearest first.
+
+    A compressed conversation keeps one stable id but its lease can bind to an
+    ancestor: hermes_state_compression._session_turn_lease_key_on_conn walks the same
+    chain before every lease write. Looking only at the child would report "free" while
+    a turn is running, and the window would send into a fence that then refuses it.
+    """
+    out, seen = [], {str(session_id)}
+    cur = str(session_id)
+    while cur and len(out) < 8:
+        out.append(cur)
+        try:
+            row = con.execute("SELECT parent_session_id FROM sessions WHERE id = ?",
+                              (cur,)).fetchone()
+        except sqlite3.Error:
+            break
+        parent = str(row[0] or "") if row else ""
+        if not parent or parent in seen:
+            break
+        seen.add(parent)
+        cur = parent
+    return out
+
+
+def session_holder(home, session_id):
+    """The surface running a turn on this session right now, or '' when it is free.
+
+    This reads session_turn_leases, NOT runtime/active_sessions.json. The registry
+    records which PROCESS has the session open, and that entry lives as long as the
+    process does - so a CLI sitting idle between turns still looked like a writer and
+    held the window blocked until someone cleared it by hand in the desktop app. That
+    registry answers "who has this session open"; the window needs "is a turn running".
+
+    The turn lease is the row the write fence actually enforces (hermes_state_messages
+    raises on a live lease), it is created when a turn starts and DELETED when the turn
+    ends (agent/turn_facade_lease.py::release), and its holder string carries the
+    platform. So the lease is both the accurate signal and the immediate one: the
+    moment a reply finishes, the row is gone and the session is free.
+    """
+    path = Path(home) / "state.db"
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
         return ""
-    entries = data.get("entries") if isinstance(data, dict) else data
-    if not isinstance(entries, list):
+    try:
+        row = None
+        for key in _lease_key_chain(con, session_id):
+            row = con.execute(
+                "SELECT holder, expires_at FROM session_turn_leases"
+                " WHERE conversation_id = ?", (key,)).fetchone()
+            if row:
+                break
+    except sqlite3.Error:
         return ""
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("session_id") or "") == str(session_id):
-            return str(entry.get("surface") or "another surface")
-    return ""
+    finally:
+        con.close()
+    if not row:
+        return ""
+    holder = str(row[0] or "")
+    try:
+        expires_at = float(row[1] or 0)
+    except (TypeError, ValueError):
+        return ""
+    if expires_at <= time.time():
+        return ""
+    # A row whose owner died is a turn that is not running: the lease is only renewed
+    # while its process is alive, so a crash must not fence the session for the rest of
+    # the TTL. Unknown liveness still counts as alive, same rule as _owner_alive.
+    m = re.search(r"pid=(\d+)", holder)
+    if m and not os.path.exists("/proc/" + m.group(1)):
+        return ""
+    m = re.search(r"platform=([A-Za-z0-9_]+)", holder)
+    return m.group(1) if m else "another surface"
 
 
 def find_session(root, session_id):

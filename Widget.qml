@@ -138,6 +138,111 @@ Panel {
   // Which surface holds a writer's lease on the open conversation, '' when free.
   // Hermes allows exactly one writer per session, so this is not advisory.
   property string chatHeld: ""
+  // Counts completed transcript reads. A probe has no way to watch a timer, and the
+  // claim "the queue keeps asking" is only worth anything if it can be counted.
+  property int chatReads: 0
+  property int chatRebuilds: 0
+  // How many times the live tail was emptied while a turn was STILL running. The flicker
+  // this window had looked exactly like that - words on screen, gone, back again - and it
+  // happens between two probe reads, so it has to be counted as it occurs rather than
+  // sampled. It must stay at zero: a clear mid-turn is the bug.
+  property int chatLiveClears: 0
+  property int chatLiveSeen: 0
+  // Messages typed while the chat is busy or leased elsewhere. Hermes allows one
+  // writer, so a send in that window would be refused outright - but refusing the
+  // TYPING is worse: it makes you sit and wait for someone else's turn to end before
+  // you can even write the sentence. So the box always takes what you give it, and
+  // the queue hands the message over the moment the chat is free again.
+  property var chatQueue: []
+  // The composer grows with what you put in it. Dictation and pasted text arrive as
+  // several lines, and a one-line box shows you only the tail of them - which is
+  // unreadable exactly when the text is worth reading twice. The log gives up the
+  // height the box takes, so the window itself stays the size it was.
+  readonly property real chatBoxMin: Style.space(52)
+  readonly property real chatBoxMax: Style.space(260)
+  // The chat window is resizable by dragging its edges. The panel re-centres itself
+  // horizontally on every width change (cardOrigin puts x at screenW/2 - contentWidth/2),
+  // so a drag on ONE side grows BOTH sides: the window scales around its centre instead
+  // of sliding to one side. Height is a different matter - the card is pinned under the
+  // bar (y = barH + gap), so it can only grow downward. There is nothing above the bar
+  // to grow into, and that is upstream geometry, not a choice made here.
+  property real chatWidth: Style.space(820)
+  property real chatLogBase: Style.space(620)
+  // While a width drag is in flight this holds the transcript's wrap width, and the
+  // transcript keeps it instead of following the window. Re-wrapping is what made the
+  // drag stutter: every mouse move resized the card, and the card resized ~415 turns of
+  // text, each one re-flowing its lines. Freezing the wrap width takes that work off the
+  // drag entirely; the text re-flows once, on release. 0 means "not dragging".
+  property real dragWrap: 0
+  // The composer's height follows the width too: a narrower window wraps the draft into
+  // more lines, the box grows, and the log shrinks to pay for it. During a drag that
+  // reads as the whole window jumping while you are only pulling one edge. Hold the box
+  // at the height it had when the drag started, and let it settle on release.
+  property real dragBox: 0
+  function beginDrag() {
+    root.dragWrap = turns.width
+    root.dragBox = root.chatBoxHeight
+  }
+  function endDrag() {
+    root.dragWrap = 0
+    root.dragBox = 0
+  }
+  // A drag that never gets its release - a stray click, a pointer the compositor took
+  // away - would leave the transcript frozen at a stale width and silently stop it
+  // wrapping. Any change of conversation ends the drag state.
+  onChatLiveChanged: {
+    if (root.chatPending && root.chatLive === "" && root.chatLiveSeen > 0)
+      root.chatLiveClears = root.chatLiveClears + 1
+    if (root.chatLive !== "") root.chatLiveSeen = root.chatLive.length
+  }
+  onChatChanged: root.endDrag()
+  // Text size, on Ctrl+= / Ctrl+- (Ctrl+0 puts it back). The chat uses exactly two
+  // sizes, so one multiplier over them is enough. Everything inside the panel scales -
+  // the conversation, the roster, the footer hints - because it is all one window and
+  // one setting is easier to reason about than three. The bar widget's own label keeps
+  // the theme's size: it lives in the bar, not in this window, and growing it would
+  // push the bar around for a setting about reading.
+  property real fontScale: 1.0
+  readonly property real fontMin: 0.75
+  readonly property real fontMax: 1.8
+  readonly property real fontStep: 0.1
+  function fs(px) {
+    return Math.round(px * root.fontScale)
+  }
+  function bumpFont(delta) {
+    var next = Math.round((root.fontScale + delta) * 100) / 100
+    root.fontScale = Math.max(root.fontMin, Math.min(root.fontMax, next))
+  }
+  function resetFont() {
+    root.fontScale = 1.0
+  }
+  readonly property real chatMinWidth: Style.space(420)
+  readonly property real chatMaxWidth: Style.space(1400)
+  readonly property real chatMinLog: Style.space(170)
+  readonly property real chatMaxLog: Style.space(740)
+  function clampChatWidth(v) {
+    return Math.max(root.chatMinWidth, Math.min(root.chatMaxWidth, v))
+  }
+  function clampChatLog(v) {
+    return Math.max(root.chatMinLog, Math.min(root.chatMaxLog, v))
+  }
+  // The field's own height. A TextArea draws its text INSIDE its own padding, so a
+  // height equal to contentHeight leaves it only contentHeight - top - bottom of room
+  // and the last line disappears under the bottom edge. The padding has to be added,
+  // not assumed. Capped so a very long paste scrolls instead of filling the screen.
+  readonly property real chatInputHeight: Math.max(Style.space(26),
+                                            Math.min(root.chatBoxMax - Style.space(26),
+                                                     chatInput.contentHeight
+                                                     + chatInput.topPadding
+                                                     + chatInput.bottomPadding))
+  readonly property real chatBoxHeight: root.dragBox > 0 ? root.dragBox
+                                    : Math.max(root.chatBoxMin,
+                                               Math.min(root.chatBoxMax,
+                                                        root.chatInputHeight + Style.space(26)))
+  readonly property real chatLogHeight: Math.max(Style.space(170),
+                                          (root.pickerOpen ? root.chatLogBase - Style.space(280)
+                                                           : root.chatLogBase)
+                                          - (root.chatBoxHeight - root.chatBoxMin))
   // A read takes a moment, and the window can move on inside it. Every open bumps
   // the epoch; a reply stamped with an older one is a reply about a conversation
   // nobody is looking at any more, and applying it is how a stale transcript
@@ -209,6 +314,12 @@ Panel {
     st.held = root.chatHeld
     st.turns = root.chatTurns.length
     st.pending = root.chatPending
+    st.queued = root.chatQueue.length
+    st.reads = root.chatReads
+    st.live = root.chatLive.length
+    st.rebuilds = root.chatRebuilds
+    st.clears = root.chatLiveClears
+    st.box = Math.round(root.chatBoxHeight)
     st.cursor = root.cursor
     return JSON.stringify(st)
   }
@@ -269,6 +380,35 @@ Panel {
     onTriggered: if (!root.chatSeenInSnap) root.reloadChat()
   }
 
+  // The drain must never wait on a coincidence. flushQueue runs when a read completes,
+  // and a read only starts when the session's message count changes - but the lease
+  // freeing changes no count, so a queued message sat there until some unrelated refresh
+  // happened to come along. Toggling "stream" was such a refresh (toggleWork reloads),
+  // which is why that felt like the fix. While anything is queued, keep asking: the read
+  // that follows sees held as empty and flushQueue sends the message straight away.
+  Timer {
+    id: queuePump
+    interval: 1200
+    repeat: true
+    running: root.chatQueue.length > 0 && root.chat !== null
+    onTriggered: root.reloadChat()
+  }
+
+  // A lease changes without the store saying anything: Hermes refuses a second writer
+  // while the holder runs and hands the chat over the moment it exits, and neither event
+  // moves the message count - which is the one thing chatTick watches. A window read
+  // while the chat was held would therefore keep saying "held by cli", keep the header
+  // red, and keep every message queueing long after the holder was gone. So while the
+  // chat is held, ask: the read that comes back empty frees the box and lets the queue
+  // drain. The holder is another process, so nothing here can be told about its exit.
+  Timer {
+    id: leasePump
+    interval: 2000
+    repeat: true
+    running: root.chatHeld !== "" && root.chat !== null
+    onTriggered: root.reloadChat()
+  }
+
   function toggleWorkRow(index) {
     var next = {}
     for (var k in workExpanded) next[k] = workExpanded[k]
@@ -280,6 +420,18 @@ Panel {
   function escapeHtml(s) {
     return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
                     .replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+  }
+
+  // Escape, then mark up. The patterns run on already-escaped text, so nothing in a
+  // message can turn into a tag of its own. `**bold**` and `code` are the two markers
+  // the agent's replies actually carry, and leaving them raw is what put asterisks and
+  // backticks in the middle of otherwise ordinary sentences.
+  function mdEscape(s) {
+    var out = root.escapeHtml(s)
+    out = out.replace(/`([^`\n]+)`/g, function(_, c) {
+      return '<span style="color:' + String(root.accent) + '">' + c + "</span>"
+    })
+    return out.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>")
   }
 
   // Links become clickable without ever letting message text turn into markup: the
@@ -295,12 +447,12 @@ Panel {
         trail = url.charAt(url.length - 1) + trail
         url = url.slice(0, -1)
       }
-      out += root.escapeHtml(text.slice(last, m.index))
+      out += root.mdEscape(text.slice(last, m.index))
       out += '<a href="' + root.escapeHtml(url) + '">' + root.escapeHtml(url) + "</a>"
-      out += root.escapeHtml(trail)
+      out += root.mdEscape(trail)
       last = m.index + m[0].length
     }
-    return (out + root.escapeHtml(text.slice(last))).replace(/\n/g, "<br/>")
+    return (out + root.mdEscape(text.slice(last))).replace(/\n/g, "<br/>")
   }
 
   function openLink(url) {
@@ -313,14 +465,58 @@ Panel {
   // attachment over, and what a screenshot looks like once it is in the store.
   // Text cannot draw an image, so the transcript pulls the refs out and draws them
   // above the words. `[screenshot]` is a display marker that carries no path.
-  function imagePathsIn(text) {
-    var out = [], re = /@image:(\S+)/g, m
-    while ((m = re.exec(String(text))) !== null) out.push(m[1])
+  // Only an absolute path ending in an image suffix is worth drawing. Message text talks
+  // about these markers - the window's own replies quote them when explaining the
+  // feature - and a bare "/path" or "<suffix>" is prose, not a file. A failed Image
+  // retries, and a screenful of retries is what pegged the shell at 80% CPU and made the
+  // whole window feel heavy.
+  function looksLikeImage(p) {
+    var s = String(p || "").trim()
+    if (s.charAt(0) !== "/") return false
+    return root.isImagePath(s)
+  }
+
+  // A collapsed work row draws four lines. Laying out ninety thousand characters to show
+  // four of them is waste, and this conversation has single messages that long. An
+  // expanded row still gets the whole text - that is what expanding it is for.
+  readonly property int workShownChars: 4000
+  function workShown(text, i) {
+    var s = String(text || "")
+    if (root.workExpanded[i] || s.length <= root.workShownChars) return s
+    return s.slice(0, root.workShownChars)
+  }
+
+  function imagePathsIn(text, role) {
+    var out = [], m
+    var s = String(text)
+    var re = /@image:(\S+)/g
+    while ((m = re.exec(s)) !== null)
+      if (root.looksLikeImage(m[1])) out.push(m[1])
+    // The bracketed form is written by Hermes for an attachment YOU sent, and only for
+    // that. A bot turn that merely mentions the marker - explaining the feature, as this
+    // window's own replies do - is prose. Drawing it meant a load that fails, retries,
+    // and is rebuilt by every read: the shell sat at 80-90% CPU.
+    if (String(role || "") !== "user") return out
+    var re2 = /\[Image attached at:\s*([^\]]+?)\s*\]/g
+    while ((m = re2.exec(s)) !== null)
+      if (root.looksLikeImage(m[1])) out.push(m[1])
     return out
   }
 
-  function textWithoutImages(text) {
-    return String(text).replace(/@image:\S+/g, "").replace(/\[screenshot\]/g, "").trim()
+  // Strip only what was actually drawn as a picture. A message that merely mentions the
+  // marker - the window's own replies do, when explaining the feature - keeps its words:
+  // removing text that produced no image is how prose about the format disappeared.
+  function textWithoutImages(text, role) {
+    var s = String(text)
+    s = s.replace(/@image:\S+/g, function(m) {
+      return root.looksLikeImage(m.slice(7)) ? "" : m
+    })
+    if (String(role || "") === "user")
+      s = s.replace(/\[Image attached at:[^\]]*\]/g, function(m) {
+        var inner = m.replace(/^\[Image attached at:\s*/, "").replace(/\]$/, "")
+        return root.looksLikeImage(inner) ? "" : m
+      })
+    return s.replace(/\[screenshot\]/g, "").trim()
   }
 
   function clockOf(ts) {
@@ -370,6 +566,10 @@ Panel {
   // everything above the chat, never loses focus, and reads as the same widget.
   function openPicker() {
     pickerOpen = true
+    // Hand the keys back to the panel for as long as the browser is up. Without this
+    // the box keeps the focus it already had, the catcher stays blocked, and Esc goes
+    // to a control that has no idea the browser exists.
+    keyCatcher.forceActiveFocus()
     root.browseTo("")
   }
 
@@ -726,7 +926,10 @@ Panel {
           out.push({ role: String(turns[i].role), text: String(turns[i].text),
                      ts: turns[i].ts || 0 })
         }
-        root.chatTurns = out
+        if (!root.sameTurns(out)) {
+          root.chatTurns = out
+          root.chatRebuilds = root.chatRebuilds + 1
+        }
         root.chatRenderedCount = Number(d.message_count || 0)
         // Who holds the write lease. Re-read on every tick, so the window knows the
         // moment the desktop opens or releases the chat.
@@ -757,6 +960,10 @@ Panel {
                         title: String(d.title || root.chat.title),
                         session_id: root.chat.session_id,
                         isNew: root.chat.isNew === true }
+        // The lease is re-read on every tick, so this is where a queued message gets
+        // its chance: the moment the chat is free, it goes out without you touching
+        // anything.
+        root.flushQueue()
       }
     }
     stderr: SplitParser {
@@ -767,6 +974,7 @@ Panel {
     }
     onExited: function(code) {
       root.chatLoading = false
+      root.chatReads += 1
       // A tick that arrived mid-read asked for another one.
       if (root.chatRereadPending) root.reloadChat()
     }
@@ -832,11 +1040,23 @@ Panel {
       // A beat before re-reading: the row is written as the turn completes, and
       // this is what keeps the window from flashing an empty reply.
       chatSettle.restart()
+      // The turn just ended, which is the other moment the chat becomes free.
+      root.flushQueue()
     }
   }
 
   // Focus follows the window, not the click: after sending, the box is ready again.
-  Timer { id: chatFocus; interval: 80; onTriggered: if (root.chat !== null) chatInput.forceActiveFocus() }
+  // Two things must hold before the box may take the keys:
+  //   - it is enabled. A disabled TextField cannot hold focus, and forceActiveFocus()
+  //     on one leaves the window with NO active item at all, which silently kills
+  //     every key in the panel, Esc included.
+  //   - the browser is folded away. While it is open the keys belong to the panel,
+  //     so Esc reaches the catcher and can close the browser instead of the chat.
+  // Without both, the browser was impossible to dismiss from the keyboard: the only
+  // thing listening was a box that either could not hold focus or swallowed the key.
+  Timer { id: chatFocus; interval: 80
+          onTriggered: if (root.chat !== null && chatInput.enabled && !root.pickerOpen)
+                         chatInput.forceActiveFocus() }
   Timer { id: chatSettle; interval: 350; onTriggered: root.reloadChat() }
 
   // The directory listing behind the in-panel browser. One call per directory, so
@@ -1027,8 +1247,12 @@ Panel {
   // rows, because one turn can be twenty of them.
   function threadCommand() {
     var cmd = [root.watcher, "--thread", root.chat.session_id, "--source", chatSource]
-    if (root.showWork) return cmd.concat(["--limit", "240", "--work"])
-    return cmd.concat(["--limit", "80"])
+    // The window draws every row it is handed, and a row costs its text layout. Four
+    // hundred rows - work rows included - held the shell at 40-50% of a core while the
+    // chat was open, which is what "heavy" felt like. This is several screens of
+    // conversation, more than the window can show at once.
+    if (root.showWork) return cmd.concat(["--limit", "80", "--work"])
+    return cmd.concat(["--limit", "40"])
   }
 
   function toggleWork() {
@@ -1131,17 +1355,11 @@ Panel {
     threadProc.running = true
   }
 
+  // Take what is in the box and either send it or hold it. Nothing is ever dropped:
+  // a chat that is mid-turn, or leased by another surface, queues instead of refusing.
   function sendChat() {
     var text = String(chatInput.text || "")
-    if (!root.chat || root.chatPending) return
-    // Never fire a write the lease will refuse: it would cost a turn's worth of
-    // waiting to learn what the header already says.
-    if (root.chatHeld !== "") {
-      root.chatError = "This chat is open in " + root.chatHeld
-                     + ", and Hermes allows one writer per chat. Use the link above "
-                     + "to talk in the bot's own Bot Chat."
-      return
-    }
+    if (!root.chat) return
     if (text.trim() === "" && chatAttach.length === 0) return
     // Files ride the turn the way the desktop hands them over: an image goes
     // through --image so the model actually SEES it, anything else becomes an
@@ -1156,16 +1374,31 @@ Panel {
     var body = text
     if (refs.length > 0) body = (body.trim() === "" ? "" : body + "\n") + refs.join(" ")
     if (body.trim() === "") body = "(see the attached image)"
+    chatInput.text = ""
+    root.clearAttach()
+    if (root.chatPending || root.chatHeld !== "") {
+      // Deliberately no echo here: the turn has not been handed over, and the poll
+      // would wipe it on its next tick. The strip under the box is what says it is
+      // waiting, and the echo happens for real when dispatchChat runs.
+      chatQueue = chatQueue.concat([{ body: body, image: image }])
+      return
+    }
+    root.dispatchChat(body, image)
+  }
+
+  // Hand one message to the agent. Kept apart from sendChat because the queue drains
+  // through the same door, and the two must not drift apart.
+  function dispatchChat(body, image) {
     // Echo it now: the agent takes a few seconds to even record the turn, and a
     // box that appears to swallow what you typed reads as broken.
     chatTurns = chatTurns.concat([{ role: "user", text: body,
                                     ts: Math.floor(Date.now() / 1000) }])
     chatLive = ""
     chatLiveWork = []
+    chatLiveSeen = 0
     chatError = ""
     chatPending = true
     chatSendCount = root.chatRenderedCount
-    chatInput.text = ""
     // A brand-new chat is addressed by NAME: it does not exist yet, so there is no
     // id to resume. Its id arrives on the stream once the first turn creates it.
     var cmd = [root.sender, "--bot", root.chat.bot]
@@ -1175,8 +1408,45 @@ Panel {
     if (image !== "") cmd = cmd.concat(["--image", image])
     sendProc.command = cmd
     sendProc.running = true
-    root.clearAttach()
     chatFocus.restart()
+  }
+
+  // Drain the queue, but only when the chat can actually take a turn.
+  function flushQueue() {
+    if (chatQueue.length === 0) return
+    if (root.chatPending || root.chatHeld !== "" || !root.chat) return
+    var head = chatQueue[0]
+    chatQueue = chatQueue.slice(1)
+    root.dispatchChat(head.body, head.image)
+  }
+
+  function dropQueue() { chatQueue = [] }
+
+  // True when the transcript the store just sent is the one already on screen.
+  // Assigning a new array rebuilds every turn; the pump reads about once a second, and
+  // rebuilding an unchanged transcript is what made the view twitch while you watched it.
+  function sameTurns(a) {
+    var b = root.chatTurns
+    if (!b || a.length !== b.length) return false
+    for (var i = 0; i < a.length; i++)
+      if (a[i].role !== b[i].role || a[i].text !== b[i].text || a[i].ts !== b[i].ts)
+        return false
+    return true
+  }
+
+  // True when this stored turn is the very text the live tail is already showing.
+  // While a reply streams, the store can already carry a prefix of it, and drawing both
+  // put the answer on screen twice - once with a clock, once without. Clearing the tail
+  // to fix that made the words vanish mid-sentence and the view jump, so the stored copy
+  // is hidden instead: the live text stays still, and the transcript takes over in one
+  // step when the turn ends and the tail is dropped.
+  function turnDupesTail(turn, i) {
+    var tail = String(root.chatLive)
+    if (tail === "" || i !== root.chatTurns.length - 1) return false
+    if (String(turn.role) !== "bot") return false
+    var stored = String(turn.text || "")
+    if (stored === "") return false
+    return stored.indexOf(tail) === 0 || tail.indexOf(stored) === 0
   }
 
   // The old behaviour, kept on its own key: hand the row to Hermes Desktop.
@@ -1309,6 +1579,45 @@ Panel {
       if (!root.opened) root.open()
       root.attachFile(String(path))
       return JSON.stringify({ attached: root.chatAttach.length })
+    }
+    // Put text in the box without a keyboard, and cancel what is queued. A probe has
+    // neither, and both states are worth being able to reach from a script.
+    function draft(text: string): string {
+      if (!root.opened) root.open()
+      chatInput.text = String(text)
+      return JSON.stringify({ box: Math.round(root.chatBoxHeight),
+                              lines: chatInput.lineCount,
+                              w: Math.round(chatInput.width),
+                              ch: Math.round(chatInput.contentHeight),
+                              th: Math.round(chatInput.height) })
+    }
+    function dropQueued(): string {
+      var n = root.chatQueue.length
+      root.dropQueue()
+      return JSON.stringify({ dropped: n })
+    }
+    // Drive the resize from outside: a probe has no mouse, and the centring claim
+    // ("one edge grows both sides") is only worth anything if it can be measured.
+    function resize(w: real, log: real): string {
+      if (w > 0) root.chatWidth = root.clampChatWidth(w)
+      if (log > 0) root.chatLogBase = root.clampChatLog(log)
+      return JSON.stringify({ x: panel.cardOrigin.x, y: panel.cardOrigin.y,
+                              w: panel.contentWidth, h: panel.contentHeight,
+                              log: Math.round(root.chatLogHeight),
+                              wrap: Math.round(turns.width),
+                              drag: root.dragWrap })
+    }
+    // Drive the font scale from outside, and report both the panel's computed sizes and
+    // the bar label's - the second must NOT move, or the setting has leaked out of the
+    // window into the bar.
+    function font(scale: real): string {
+      if (scale > 0) root.fontScale = Math.max(root.fontMin, Math.min(root.fontMax, scale))
+      return JSON.stringify({ scale: root.fontScale,
+                              body: root.fs(Style.font.bodySmall),
+                              caption: root.fs(Style.font.caption),
+                              bar: Style.font.caption,
+                              inputFocus: chatInput.activeFocus,
+                              catcherFocus: keyCatcher.activeFocus })
     }
     // A staged roster for screenshots; call again to go back to the real one.
     function demo(): string {
@@ -1658,8 +1967,8 @@ Panel {
     focusTarget: keyCatcher
     // The chat wants room to read and type in; the roster is a list and stays
     // narrow. Both are clamped to what the screen actually offers.
-    contentWidth: panel.fittedContentWidth(root.chat !== null ? Style.space(720) : Style.space(420))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight + Style.space(2), Style.space(900))
+    contentWidth: panel.fittedContentWidth(root.chat !== null ? root.chatWidth : Style.space(470))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight + Style.space(2), Style.space(930))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -1674,7 +1983,10 @@ Panel {
         if (dy !== 0) root.moveCursor(dy)
       }
       onActivateRequested: root.activateRow(root.cursor)
-      onCloseRequested: root.close()
+      // Esc means "back out of one thing", never "throw everything away". With the
+      // browser unfolded it closes the browser and leaves the conversation alone;
+      // a second Esc then closes the chat, which is what the footer promises.
+      onCloseRequested: if (root.pickerOpen) root.closePicker(); else root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "r") root.cycleBarMetric()
@@ -1684,6 +1996,11 @@ Panel {
         else if (t === "o" || t === "O") root.openRowInDesktop(root.cursor)
         else if (t === "w" || t === "W") root.toggleWork()
         else if (t === "n" || t === "N") root.startNewChatForCursor()
+        // Bare here, not Ctrl-modified: the catcher only gets a key when the composer is
+        // NOT holding it, so a lone "+" in this mode has no other meaning to protect.
+        else if (t === "+" || t === "=") root.bumpFont(root.fontStep)
+        else if (t === "-" || t === "_") root.bumpFont(-root.fontStep)
+        else if (t === "0") root.resetFont()
       }
 
       // Where the pointer is, in panel coordinates. Avatars map it into their
@@ -1762,7 +2079,7 @@ Panel {
                 }
                 color: root.sourceError ? root.urgent : root.dim
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
+                font.pixelSize: root.fs(Style.font.caption)
               }
               Text {
                 textFormat: Text.PlainText
@@ -1778,7 +2095,7 @@ Panel {
                 }
                 color: root.fg
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
+                font.pixelSize: root.fs(Style.font.bodySmall)
               }
             }
           }
@@ -1812,7 +2129,7 @@ Panel {
                   text: "‹ back"
                   color: root.dim
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                  font.pixelSize: root.fs(Style.font.caption)
                   MouseArea {
                     anchors.fill: parent
                     anchors.margins: -Style.space(4)
@@ -1831,7 +2148,7 @@ Panel {
                   text: root.showWork ? "stream on" : "stream off"
                   color: workToggle.containsMouse ? root.fg : root.faint
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                  font.pixelSize: root.fs(Style.font.caption)
                   MouseArea {
                     id: workToggle
                     anchors.fill: parent
@@ -1851,7 +2168,7 @@ Panel {
                   text: "+ new"
                   color: newArea.containsMouse ? root.fg : root.accent
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                  font.pixelSize: root.fs(Style.font.caption)
                   MouseArea {
                     id: newArea
                     anchors.fill: parent
@@ -1874,7 +2191,7 @@ Panel {
                   text: "new chat with @" + (root.chat ? root.chat.bot : "")
                   color: root.accent
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                  font.pixelSize: root.fs(Style.font.caption)
                 }
                 // A held chat is not a detail: it means nothing you type can be
                 // written, so it is said in the header rather than discovered by a
@@ -1889,7 +2206,7 @@ Panel {
                   text: "held by " + root.chatHeld
                   color: root.urgent
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                  font.pixelSize: root.fs(Style.font.caption)
                 }
                 Text {
                   anchors.right: parent.right
@@ -1901,7 +2218,7 @@ Panel {
                   text: root.chat ? (root.chat.title + "  @" + root.chat.bot) : ""
                   color: root.faint
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                  font.pixelSize: root.fs(Style.font.caption)
                 }
               }
 
@@ -1911,7 +2228,9 @@ Panel {
               Flickable {
                 id: transcript
                 width: parent.width
-                height: root.pickerOpen ? Style.space(260) : Style.space(520)
+                // The log yields exactly what the composer takes, so the window keeps
+                // its size while the box grows into the room.
+                height: root.chatLogHeight
                 contentWidth: width
                 contentHeight: turns.implicitHeight + Style.space(8)
                 clip: true
@@ -1924,7 +2243,7 @@ Panel {
                 Column {
                   id: turns
                   x: Style.space(4)
-                  width: parent.width - Style.space(8)
+                  width: root.dragWrap > 0 ? root.dragWrap : parent.width - Style.space(8)
                   topPadding: Style.space(4)
                   spacing: Style.space(6)
 
@@ -1935,7 +2254,7 @@ Panel {
                     text: "reading the conversation…"
                     color: root.dim
                     font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
+                    font.pixelSize: root.fs(Style.font.caption)
                   }
 
                   Text {
@@ -1945,7 +2264,7 @@ Panel {
                     text: "nothing said here yet."
                     color: root.dim
                     font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
+                    font.pixelSize: root.fs(Style.font.caption)
                   }
 
                   Repeater {
@@ -1956,6 +2275,13 @@ Panel {
                       required property var modelData
                       width: turns.width
                       spacing: Style.space(1)
+                      // The live tail below is already showing this same reply. Drawing
+                      // the stored copy as well is what printed the answer twice; hiding
+                      // it here - instead of clearing the tail - keeps the words still
+                      // while they arrive. When the turn ends the tail goes and this
+                      // takes over in one step.
+                      visible: !root.turnDupesTail(turnBlock.modelData, turnBlock.index)
+                      height: visible ? implicitHeight : 0
 
                       Row {
                         spacing: Style.space(6)
@@ -1968,7 +2294,7 @@ Panel {
                                                  root.chat ? root.chat.bot : "")
                           color: root.roleColor(turnBlock.modelData.role)
                           font.family: root.fontFamily
-                          font.pixelSize: Style.font.caption
+                          font.pixelSize: root.fs(Style.font.caption)
                         }
                         Text {
                           textFormat: Text.PlainText
@@ -1977,7 +2303,7 @@ Panel {
                           text: root.clockOf(turnBlock.modelData.ts)
                           color: root.faint
                           font.family: root.fontFamily
-                          font.pixelSize: Style.font.caption
+                          font.pixelSize: root.fs(Style.font.caption)
                         }
                         Text {
                           textFormat: Text.PlainText
@@ -1985,7 +2311,7 @@ Panel {
                           text: root.workExpanded[turnBlock.index] ? "less" : "more"
                           color: root.faint
                           font.family: root.fontFamily
-                          font.pixelSize: Style.font.caption
+                          font.pixelSize: root.fs(Style.font.caption)
                           MouseArea {
                             anchors.fill: parent
                             anchors.margins: -Style.space(4)
@@ -1996,7 +2322,8 @@ Panel {
                       }
                       // Anything the turn carried as an image, drawn as itself.
                       Repeater {
-                        model: root.imagePathsIn(turnBlock.modelData.text)
+                        model: root.imagePathsIn(turnBlock.modelData.text,
+                                                 turnBlock.modelData.role)
 
                         Rectangle {
                           id: shot
@@ -2006,8 +2333,13 @@ Panel {
                           color: "transparent"
                           border.color: root.faint
                           border.width: 1
+                          // A path that only looks like an image - prose in a message that
+                          // happens to end in .png - cannot be drawn. Left alone, the
+                          // failed load retries forever and the shell sits at 90% CPU.
+                          visible: shotImg.status !== Image.Error
 
                           Image {
+                            id: shotImg
                             anchors.fill: parent
                             anchors.margins: 1
                             source: "file://" + shot.modelData
@@ -2015,6 +2347,7 @@ Panel {
                             asynchronous: true
                             sourceSize.width: 760
                             sourceSize.height: 420
+                            onStatusChanged: if (status === Image.Error) source = ""
                           }
                           MouseArea {
                             anchors.fill: parent
@@ -2037,14 +2370,16 @@ Panel {
                                                                       : Text.ElideNone
                         text: root.richText(root.isWorkRole(turnBlock.modelData.role)
                               ? root.workBody(turnBlock.modelData.role,
-                                              turnBlock.modelData.text)
-                              : root.textWithoutImages(turnBlock.modelData.text))
+                                              root.workShown(turnBlock.modelData.text,
+                                                             turnBlock.index))
+                              : root.textWithoutImages(turnBlock.modelData.text,
+                                                       turnBlock.modelData.role))
                         color: root.isWorkRole(turnBlock.modelData.role)
                                ? (turnBlock.modelData.role === "result" ? root.dim : root.faint)
                                : root.fg
                         linkColor: root.accent
                         font.family: root.fontFamily
-                        font.pixelSize: Style.font.bodySmall
+                        font.pixelSize: root.fs(Style.font.bodySmall)
                         onLinkActivated: function(link) { root.openLink(link) }
                       }
                     }
@@ -2071,7 +2406,7 @@ Panel {
                         text: root.workLabel(liveWork.modelData.role, liveWork.modelData.text)
                         color: root.roleColor(liveWork.modelData.role)
                         font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
+                        font.pixelSize: root.fs(Style.font.caption)
                       }
                       Text {
                         width: parent.width
@@ -2084,7 +2419,7 @@ Panel {
                                                           liveWork.modelData.text))
                         color: root.dim
                         font.family: root.fontFamily
-                        font.pixelSize: Style.font.bodySmall
+                        font.pixelSize: root.fs(Style.font.bodySmall)
                       }
                     }
                   }
@@ -2099,7 +2434,7 @@ Panel {
                       text: "@" + (root.chat ? root.chat.bot : "")
                       color: root.accent
                       font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
+                      font.pixelSize: root.fs(Style.font.caption)
                     }
                     Text {
                       width: parent.width
@@ -2108,7 +2443,7 @@ Panel {
                       text: root.chatLive
                       color: root.fg
                       font.family: root.fontFamily
-                      font.pixelSize: Style.font.bodySmall
+                      font.pixelSize: root.fs(Style.font.bodySmall)
                     }
                   }
 
@@ -2119,7 +2454,7 @@ Panel {
                     text: "thinking…"
                     color: root.dim
                     font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
+                    font.pixelSize: root.fs(Style.font.caption)
                   }
                 }
               }
@@ -2170,7 +2505,7 @@ Panel {
                         text: (chip.isImage ? "" : "▤ ") + chip.modelData.name
                         color: root.dim
                         font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
+                        font.pixelSize: root.fs(Style.font.caption)
                         elide: Text.ElideMiddle
                         height: chip.height
                         verticalAlignment: Text.AlignVCenter
@@ -2181,7 +2516,7 @@ Panel {
                         text: "×"
                         color: chipDrop.containsMouse ? root.urgent : root.dim
                         font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
+                        font.pixelSize: root.fs(Style.font.caption)
                         height: chip.height
                         verticalAlignment: Text.AlignVCenter
                         MouseArea {
@@ -2201,47 +2536,65 @@ Panel {
               // ---- the box
               Item {
                 width: parent.width
-                height: Style.space(52)
+                height: root.chatBoxHeight
 
-                // Attach: hands off to the platform picker, and whatever comes back
-                // is queued as a chip above.
+                // Attach: folds the browser open, and folds it back. It has to be a
+                // toggle - the browser sits over the conversation, so the same click
+                // that summoned it is the one that has to take it away when you
+                // change your mind. A one-way button here strands you in the listing.
                 Text {
                   id: attachButton
                   anchors.left: parent.left
-                  anchors.verticalCenter: parent.verticalCenter
+                  // Pinned to the first line rather than centred: the box grows
+                  // downward, and a centred button would drift into the middle of a
+                  // paragraph the moment you paste one.
+                  anchors.top: parent.top
+                  anchors.topMargin: Style.space(15)
                   textFormat: Text.PlainText
                   text: "＋"
-                  color: attachArea.containsMouse ? root.fg : root.dim
+                  color: root.pickerOpen ? root.fg
+                                         : (attachArea.containsMouse ? root.fg : root.dim)
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
+                  font.pixelSize: root.fs(Style.font.bodySmall)
                   MouseArea {
                     id: attachArea
                     anchors.fill: parent
                     anchors.margins: -Style.space(6)
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: root.openPicker()
+                    onClicked: root.pickerOpen ? root.closePicker() : root.openPicker()
                   }
                 }
 
-                TextField {
+                // A TextArea, not a TextField: this one wraps, and it reports the height
+                // its text actually needs - which is what lets the box grow with a
+                // dictation or a paste instead of scrolling it sideways along one
+                // endless line you cannot read.
+                TextArea {
                   id: chatInput
                   anchors.left: attachButton.right
                   anchors.leftMargin: Style.space(14)
-                  anchors.right: sendButton.left
-                  anchors.rightMargin: Style.space(10)
-                  anchors.verticalCenter: parent.verticalCenter
-                  enabled: !root.chatPending && root.chatHeld === ""
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(14)
+                  anchors.top: parent.top
+                  anchors.topMargin: Style.space(13)
+                  height: root.chatInputHeight
+                  // Always writable. A chat mid-turn, or a lease held by another
+                  // surface, no longer stops you composing: the message queues and
+                  // leaves on its own. Locking the box meant waiting for someone else's
+                  // turn to end before you could even write the sentence.
+                  enabled: true
+                  wrapMode: TextArea.Wrap
+                  textFormat: TextEdit.PlainText
                   placeholderText: root.chatHeld !== ""
-                                   ? "this chat is open in " + root.chatHeld
-                                     + " - Hermes allows one writer"
+                                   ? "held by " + root.chatHeld + " - your message will queue"
                                    : (root.chatPending
-                                      ? "waiting for the bot…"
+                                      ? "the bot is thinking - type on, it will queue"
                                       : "message @" + (root.chat ? root.chat.bot : ""))
                   color: root.fg
                   placeholderTextColor: root.faint
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
+                  font.pixelSize: root.fs(Style.font.bodySmall)
                   selectByMouse: true
                   background: Rectangle {
                     color: "transparent"
@@ -2249,40 +2602,78 @@ Panel {
                     border.width: 1
                     radius: 2
                   }
-                  onAccepted: root.sendChat()
+                  // Enter sends, Shift+Enter is a line break - the convention the
+                  // desktop uses, and the only way to write a paragraph in a box that
+                  // grows.
+                  Keys.onReturnPressed: function(event) {
+                    if (event.modifiers & Qt.ShiftModifier) { event.accepted = false; return }
+                    root.sendChat()
+                    event.accepted = true
+                  }
+                  Keys.onEnterPressed: function(event) {
+                    if (event.modifiers & Qt.ShiftModifier) { event.accepted = false; return }
+                    root.sendChat()
+                    event.accepted = true
+                  }
                   Keys.onEscapePressed: root.pickerOpen ? root.closePicker() : root.closeChat()
+                  // The catcher is blocked while this field holds the keys, so Ctrl+= and
+                  // Ctrl+- would otherwise only work while reading, never while typing -
+                  // which is exactly when you notice the text is too small.
+                  Keys.onPressed: function(event) {
+                    if (!(event.modifiers & Qt.ControlModifier)) return
+                    if (event.key === Qt.Key_Plus || event.key === Qt.Key_Equal) {
+                      root.bumpFont(root.fontStep); event.accepted = true
+                    } else if (event.key === Qt.Key_Minus) {
+                      root.bumpFont(-root.fontStep); event.accepted = true
+                    } else if (event.key === Qt.Key_0) {
+                      root.resetFont(); event.accepted = true
+                    }
+                  }
                   onVisibleChanged: if (visible) chatFocus.restart()
                 }
 
-                // Enter, in a frame of its own: it is the one control in this window,
-                // so it should look like a control.
-                Rectangle {
-                  id: sendButton
+                // Deliberately no send button. Enter sends and Shift+Enter breaks the
+                // line, so the button only ever duplicated the key your hand was
+                // already on - and it cost the field a strip of width for it.
+              }
+
+              // What is waiting for the chat to free up. Without this the queue would be
+              // invisible, and a message you typed would look lost - which is the exact
+              // fear the old lock was built on.
+              Item {
+                width: parent.width
+                height: visible ? Style.space(24) : 0
+                visible: root.chatQueue.length > 0
+                Text {
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width - Style.space(70)
+                  elide: Text.ElideRight
+                  textFormat: Text.PlainText
+                  text: root.chatQueue.length > 0
+                        ? "⏳ waiting to send: "
+                          + String(root.chatQueue[0].body || "").split("\n")[0]
+                        : ""
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(Style.font.caption)
+                }
+                Text {
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
-                  width: Style.space(48)
-                  height: Style.space(26)
-                  radius: 3
-                  color: sendArea.containsMouse && !root.chatPending && root.chatHeld === ""
-                         ? root.hilite : "transparent"
-                  border.width: 1
-                  border.color: root.chatPending || root.chatHeld !== "" ? root.faint : root.divider
-                  opacity: root.chatPending || root.chatHeld !== "" ? 0.45 : 1
-                  Text {
-                    anchors.centerIn: parent
-                    textFormat: Text.PlainText
-                    text: "⏎ send"
-                    color: root.fg
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
+                  textFormat: Text.PlainText
+                  text: root.chatQueue.length > 1
+                        ? "✕ drop all " + root.chatQueue.length : "✕ drop"
+                  color: dropArea.containsMouse ? root.urgent : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(Style.font.caption)
                   MouseArea {
-                    id: sendArea
+                    id: dropArea
                     anchors.fill: parent
+                    anchors.margins: -Style.space(4)
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
-                    enabled: !root.chatPending && root.chatHeld === ""
-                    onClicked: root.sendChat()
+                    onClicked: root.dropQueue()
                   }
                 }
               }
@@ -2298,7 +2689,7 @@ Panel {
                       + "'s own Bot Chat instead"
                 color: switchArea.containsMouse ? root.fg : root.accent
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
+                font.pixelSize: root.fs(Style.font.caption)
                 MouseArea {
                   id: switchArea
                   anchors.fill: parent
@@ -2318,7 +2709,7 @@ Panel {
                 text: root.chatError
                 color: root.urgent
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
+                font.pixelSize: root.fs(Style.font.caption)
               }
 
               // ---- the file browser, unfolding downward under the box
@@ -2335,18 +2726,19 @@ Panel {
 
                   Rectangle { width: parent.width; height: 1; color: root.faint }
 
-                  // where we are, and the way up
+                  // where we are, the way up, and the way out
                   Item {
                     width: parent.width
                     height: Style.space(28)
                     Text {
+                      id: upLabel
                       anchors.left: parent.left
                       anchors.verticalCenter: parent.verticalCenter
                       textFormat: Text.PlainText
                       text: "‹ up"
                       color: root.pickerParent !== "" ? root.dim : root.faint
                       font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
+                      font.pixelSize: root.fs(Style.font.caption)
                       MouseArea {
                         anchors.fill: parent
                         anchors.margins: -Style.space(5)
@@ -2355,17 +2747,41 @@ Panel {
                         onClicked: root.browseTo(root.pickerParent)
                       }
                     }
+                    // A way out the mouse can reach. Esc does the same thing, but the
+                    // browser is summoned by a click, so it has to be dismissable by
+                    // one too - otherwise a hand that never leaves the mouse is stuck
+                    // staring at a directory listing it cannot put away.
                     Text {
+                      id: closeLabel
                       anchors.right: parent.right
                       anchors.verticalCenter: parent.verticalCenter
-                      width: parent.width - Style.space(70)
+                      textFormat: Text.PlainText
+                      text: "✕ close"
+                      color: closeArea.containsMouse ? root.fg : root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fs(Style.font.caption)
+                      MouseArea {
+                        id: closeArea
+                        anchors.fill: parent
+                        anchors.margins: -Style.space(5)
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.closePicker()
+                      }
+                    }
+                    Text {
+                      anchors.left: upLabel.right
+                      anchors.right: closeLabel.left
+                      anchors.leftMargin: Style.space(12)
+                      anchors.rightMargin: Style.space(12)
+                      anchors.verticalCenter: parent.verticalCenter
                       horizontalAlignment: Text.AlignRight
                       elide: Text.ElideLeft
                       textFormat: Text.PlainText
                       text: root.pickerDir
                       color: root.faint
                       font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
+                      font.pixelSize: root.fs(Style.font.caption)
                     }
                   }
 
@@ -2397,7 +2813,7 @@ Panel {
                         text: "nothing here"
                         color: root.dim
                         font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
+                        font.pixelSize: root.fs(Style.font.caption)
                       }
                       Text {
                         width: parent.width
@@ -2407,7 +2823,7 @@ Panel {
                         text: root.pickerError
                         color: root.urgent
                         font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
+                        font.pixelSize: root.fs(Style.font.caption)
                       }
 
                       Repeater {
@@ -2434,14 +2850,14 @@ Panel {
                               text: entryRow.modelData.dir ? "▸" : " "
                               color: root.accent
                               font.family: root.fontFamily
-                              font.pixelSize: Style.font.caption
+                              font.pixelSize: root.fs(Style.font.caption)
                             }
                             Text {
                               textFormat: Text.PlainText
                               text: entryRow.modelData.name + (entryRow.modelData.dir ? "/" : "")
                               color: entryRow.modelData.dir ? root.fg : root.dim
                               font.family: root.fontFamily
-                              font.pixelSize: Style.font.bodySmall
+                              font.pixelSize: root.fs(Style.font.bodySmall)
                               elide: Text.ElideMiddle
                               width: Math.min(implicitWidth, files.width - Style.space(96))
                             }
@@ -2451,7 +2867,7 @@ Panel {
                               text: root.humanSize(entryRow.modelData.size)
                               color: root.faint
                               font.family: root.fontFamily
-                              font.pixelSize: Style.font.caption
+                              font.pixelSize: root.fs(Style.font.caption)
                             }
                           }
                           MouseArea {
@@ -2531,7 +2947,7 @@ Panel {
                 text: root.label(modelData.name).toUpperCase() + "  " + (modelData.count || "")
                 color: root.dim
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
+                font.pixelSize: root.fs(Style.font.caption)
               }
 
               // The session rows: the one hanging off a bot, and its pinned chats.
@@ -2589,7 +3005,7 @@ Panel {
                 }
                 color: modelData.kind === "attach" && modelData.mode === "live" ? root.accent : root.dim
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
+                font.pixelSize: root.fs(Style.font.caption)
                 elide: Text.ElideRight
                 maximumLineCount: 1
               }
@@ -2602,7 +3018,7 @@ Panel {
                 text: root.fmtAgo(modelData.session ? modelData.session.last_activity_at : 0)
                 color: root.faint
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
+                font.pixelSize: root.fs(Style.font.caption)
               }
 
               // The pinned section, and the bot each group of pinned chats belongs
@@ -2616,7 +3032,7 @@ Panel {
                 text: "PINNED"
                 color: root.dim
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
+                font.pixelSize: root.fs(Style.font.caption)
               }
               Text {
                 textFormat: Text.PlainText
@@ -2632,7 +3048,7 @@ Panel {
                 text: root.label(String((modelData.bot || {}).title || (modelData.bot || {}).name || "")).toUpperCase()
                 color: root.faint
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
+                font.pixelSize: root.fs(Style.font.caption)
               }
 
               // bot row
@@ -2705,7 +3121,7 @@ Panel {
                         // "this one wants you".
                         color: root.fg
                         font.family: root.fontFamily
-                        font.pixelSize: Style.font.bodySmall
+                        font.pixelSize: root.fs(Style.font.bodySmall)
                         font.bold: modelData.kind === "bot"
                           && (modelData.bot.waiting || (modelData.bot.chat && modelData.bot.chat.unread))
                       }
@@ -2714,7 +3130,7 @@ Panel {
                         text: modelData.kind === "bot" ? root.label(modelData.bot.handle || "") : ""
                         color: root.dim
                         font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
+                        font.pixelSize: root.fs(Style.font.caption)
                         elide: Text.ElideRight
                         width: Math.max(0, parent.width - Style.space(120))
                       }
@@ -2729,7 +3145,7 @@ Panel {
                       color: modelData.kind === "bot" && modelData.bot.waiting ? root.fg
                              : (modelData.kind === "bot" && modelData.bot.active ? root.accent : root.dim)
                       font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
+                      font.pixelSize: root.fs(Style.font.caption)
                       elide: Text.ElideRight
                       maximumLineCount: 1
                     }
@@ -2747,7 +3163,7 @@ Panel {
                       text: modelData.kind === "bot" ? root.fmtAgo(root.lastActivity(modelData.bot)) : ""
                       color: root.dim
                       font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
+                      font.pixelSize: root.fs(Style.font.caption)
                     }
                     Rectangle {
                       anchors.right: parent.right
@@ -2772,7 +3188,7 @@ Panel {
                           ? String(modelData.bot.unread_count || 1) : "\u2022"
                         color: Color.background
                         font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
+                        font.pixelSize: root.fs(Style.font.caption)
                       }
                     }
                   }
@@ -2810,7 +3226,7 @@ Panel {
             text: "no bots in this Hermes install yet"
             color: root.dim
             font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
+            font.pixelSize: root.fs(Style.font.bodySmall)
           }
 
           Rectangle { width: parent.width; height: 1; color: root.faint; visible: root.bots.length > 0 && root.chat === null }
@@ -2834,6 +3250,7 @@ Panel {
                                               + (root.newBot !== "" ? root.newBot : "chat")
             readonly property string showLine: "<b>g</b> " + root.ordering + " · <b>p</b> pinned · <b>s</b> "
                                                + root.source + " · <b>r</b> " + root.barMetric
+                                               + " · <b>+/-</b> text " + Math.round(root.fontScale * 100) + "%"
 
             // The two lines are centred as a block and within themselves, so the
             // footer reads as a caption under the card rather than a column of
@@ -2855,7 +3272,7 @@ Panel {
                 text: footer.actLine
                 color: root.dim
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
+                font.pixelSize: root.fs(Style.font.caption)
               }
               Text {
                 id: showText
@@ -2866,10 +3283,133 @@ Panel {
                 text: footer.showLine
                 color: root.dim
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
+                font.pixelSize: root.fs(Style.font.caption)
               }
             }
           }
+        }
+      }
+
+      // ---- resizing the window -----------------------------------------------
+      // Three grips, and they live INSIDE the card: the layer-shell surface's input
+      // mask is the card rect, so a grip hanging outside it would never see the mouse.
+      // They are the last children here, so they sit on top of the content.
+      //
+      // Horizontal drags are doubled on purpose. The panel keeps itself centred
+      // (x = screenW/2 - contentWidth/2), so pushing the right edge out by dx also
+      // pushes the left edge out by dx: the window grows by 2*dx, around its own
+      // centre. That is what makes one edge read as "bigger" instead of "shifted
+      // sideways". Vertically the card is pinned under the bar and can only grow
+      // downward, so that drag is 1:1 - the bottom edge follows the pointer.
+      MouseArea {
+        id: gripRight
+        visible: root.chat !== null
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        width: Style.space(7)
+        height: parent.height - Style.space(80)
+        hoverEnabled: true
+        preventStealing: true
+        cursorShape: Qt.SizeHorCursor
+        property real startW: 0
+        property real startGX: 0
+        onPressed: function(mouse) {
+          startW = root.chatWidth
+          startGX = gripRight.mapToGlobal(mouse.x, mouse.y).x
+          root.beginDrag()
+        }
+        onReleased: root.endDrag()
+        onCanceled: root.endDrag()
+        onPositionChanged: function(mouse) {
+          if (!pressed) return
+          var dx = gripRight.mapToGlobal(mouse.x, mouse.y).x - startGX
+          root.chatWidth = root.clampChatWidth(startW + dx * 2)
+        }
+        // A short mark at the middle of the edge, not a line down all of it: enough to
+        // say "you can grab here", quiet enough to forget once you know.
+        Rectangle {
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          width: 2
+          height: Style.space(26)
+          radius: 1
+          color: gripRight.containsMouse ? root.accent : root.faint
+        }
+      }
+
+      MouseArea {
+        id: gripBottom
+        visible: root.chat !== null
+        anchors.bottom: parent.bottom
+        anchors.horizontalCenter: parent.horizontalCenter
+        height: Style.space(7)
+        width: parent.width - Style.space(80)
+        hoverEnabled: true
+        preventStealing: true
+        cursorShape: Qt.SizeVerCursor
+        property real startL: 0
+        property real startGY: 0
+        onPressed: function(mouse) {
+          startL = root.chatLogBase
+          startGY = gripBottom.mapToGlobal(mouse.x, mouse.y).y
+        }
+        onPositionChanged: function(mouse) {
+          if (!pressed) return
+          var dy = gripBottom.mapToGlobal(mouse.x, mouse.y).y - startGY
+          root.chatLogBase = root.clampChatLog(startL + dy)
+        }
+        Rectangle {
+          anchors.bottom: parent.bottom
+          anchors.horizontalCenter: parent.horizontalCenter
+          height: 2
+          width: Style.space(26)
+          radius: 1
+          color: gripBottom.containsMouse ? root.accent : root.faint
+        }
+      }
+
+      // The corner does both at once, so the whole window can be scaled in one gesture.
+      MouseArea {
+        id: gripCorner
+        visible: root.chat !== null
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        width: Style.space(16)
+        height: Style.space(16)
+        hoverEnabled: true
+        preventStealing: true
+        cursorShape: Qt.SizeFDiagCursor
+        property real startW: 0
+        property real startL: 0
+        property real startGX: 0
+        property real startGY: 0
+        onPressed: function(mouse) {
+          startW = root.chatWidth
+          startL = root.chatLogBase
+          var p = gripCorner.mapToGlobal(mouse.x, mouse.y)
+          startGX = p.x
+          startGY = p.y
+          root.beginDrag()
+        }
+        onReleased: root.endDrag()
+        onCanceled: root.endDrag()
+        onPositionChanged: function(mouse) {
+          if (!pressed) return
+          var p = gripCorner.mapToGlobal(mouse.x, mouse.y)
+          root.chatWidth = root.clampChatWidth(startW + (p.x - startGX) * 2)
+          root.chatLogBase = root.clampChatLog(startL + (p.y - startGY))
+        }
+        // A mark, so the grip can be found without hunting for the cursor change.
+        Text {
+          anchors.right: parent.right
+          anchors.bottom: parent.bottom
+          anchors.rightMargin: Style.space(2)
+          anchors.bottomMargin: Style.space(1)
+          textFormat: Text.PlainText
+          text: "◢"
+          color: gripCorner.containsMouse ? root.accent : root.faint
+          font.family: root.fontFamily
+          font.pixelSize: root.fs(Style.font.caption)
         }
       }
     }
