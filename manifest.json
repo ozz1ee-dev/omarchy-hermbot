@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ozz1ee.hermbot",
   "name": "Hermbot",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "author": "ozz1ee",
   "license": "Apache-2.0",
   "description": "Your Hermes Bot Mode roster in the bar: every bot drawn as its own avatar, the newest thing it said, and a chat window to talk to it without leaving the bar.",
@@ -30,7 +30,7 @@
       "ordering": "attention",
       "showPinned": true,
       "showWork": true,
-      "source": "auto"
+      "instance": "auto"
     },
     "schema": [
       {
@@ -89,15 +89,11 @@
         "description": "The chat window shows not only what a bot said but how it got there: its thinking, every tool it reached for, and what came back - the same detail Hermes Desktop shows, live while the turn runs and from the session store afterwards. The chat header reads stream on / stream off. Off leaves a plain conversation. The w key flips it and the choice is saved."
       },
       {
-        "key": "source",
-        "type": "enum",
+        "key": "instance",
+        "type": "string",
         "label": "Which instance to follow",
-        "options": [
-          "auto",
-          "local"
-        ],
         "defaultValue": "auto",
-        "description": "auto = Hermes Desktop's own connection: switch the app to another host and the bar shows that host's bots, within a poll. local = always this machine, whatever the app is on. The s key flips it and the choice is saved."
+        "description": "auto = Hermes Desktop's own connection: switch the app to another host and the bar shows that host's bots, within a poll. Anything else pins the bar - local is this machine, and an SSH connection is named by its id. The s key opens the list and the choice is saved. Deliberately not stored as 'source': a bar item already uses that name for the widget's own QML path, and a setting written under it replaces the path, after which the plugin cannot be loaded at all."
       }
     ]
   },

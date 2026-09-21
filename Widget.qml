@@ -77,8 +77,15 @@ Panel {
 
   // Which instance to follow: "auto" is Hermes Desktop's own connection, so the
   // bar holds the roster of whatever the app is on - this machine, or the SSH
-  // host it is pointed at. "local" pins it to this machine.
-  property string source: String(setting("source", "auto"))
+  // host it is pointed at. "local" pins it to this machine, and any other value is
+  // an explicit `kind:id`.
+  //
+  // Stored as `instance`, NOT `source`. The bar item has its own `source` field (the
+  // widget's QML path, from the manifest) and writing a setting under that name
+  // overwrites the path - after which the shell has nothing to load and the plugin
+  // disappears from the bar with no error anywhere. The property keeps the name
+  // `source` because that is what it means here; only the stored key is renamed.
+  property string source: String(setting("instance", "auto"))
 
   // ---- the chat window ------------------------------------------------------
   // A row opens its conversation here instead of handing it to the desktop, so
@@ -225,6 +232,25 @@ Panel {
   }
   function clampChatLog(v) {
     return Math.max(root.chatMinLog, Math.min(root.chatMaxLog, v))
+  }
+  // The roster is the same card in its other mode, so it is resized by the same three
+  // grips. Width is a plain property exactly as the chat's is. Height is a ceiling on
+  // the list's own height until a hand drags it, and from then on the height itself:
+  // the roster is content-sized when the bots are few, so without that first touch the
+  // bottom grip would feel dead - it could only ever shrink the card, never grow it.
+  // Once sized by hand the card holds that height and the list scrolls inside it.
+  property real rosterWidth: Style.space(470)
+  property real rosterHeight: Style.space(930)
+  property bool rosterSizedByHand: false
+  readonly property real rosterMinWidth: Style.space(360)
+  readonly property real rosterMaxWidth: Style.space(1000)
+  readonly property real rosterMinHeight: Style.space(320)
+  readonly property real rosterMaxHeight: Style.space(930)
+  function clampRosterWidth(v) {
+    return Math.max(root.rosterMinWidth, Math.min(root.rosterMaxWidth, v))
+  }
+  function clampRosterHeight(v) {
+    return Math.max(root.rosterMinHeight, Math.min(root.rosterMaxHeight, v))
   }
   // The field's own height. A TextArea draws its text INSIDE its own padding, so a
   // height equal to contentHeight leaves it only contentHeight - top - bottom of room
@@ -665,8 +691,13 @@ Panel {
                        last_activity_at: ago(mins), last_read_at: null, unread: unread > 0,
                        preview: text, preview_role: fromBot ? "assistant" : "user",
                        preview_ts: ago(mins), from_bot: fromBot },
-               recent_session: { session_id: "demo_r_" + name, title: null, last_activity_at: ago(mins) },
-               newest_session_id: "demo_r_" + name, hermes_cmd: "hermes -p " + name + " chat",
+               // The badge that carries the number rides the SESSION row, so the demo's
+               // measured session and its session row have to be the same id. The live
+               // payload has them equal; a demo that leaves them apart paints a number on
+               // the bot row - a shape the real roster never draws - and hides the one it
+               // does.
+               recent_session: { session_id: "demo_a_" + name, title: null, last_activity_at: ago(mins) },
+               newest_session_id: "demo_a_" + name, hermes_cmd: "hermes -p " + name + " chat",
                open: { session_id: "demo_" + name, deep_link: "", recent_deep_link: "" } }
     }
     // The shapes are the ones Hermes' own avatar picker ships - the legacy set
@@ -895,7 +926,10 @@ Panel {
     }
     onExited: function(code) { console.warn("hermbot", "watcher exited", code); restartTimer.start() }
   }
-  Timer { id: restartTimer; interval: 5000; onTriggered: watcherProc.running = true }
+  Timer { id: restartTimer; interval: 5000
+          // Back to the debounce after every use: an immediate bounce is a one-off, not
+          // a new default for the next load-time cascade.
+          onTriggered: { watcherProc.running = true; interval = 5000 } }
 
   // ------------------------------------------------------------------- chat io
   // Reading one conversation, and delivering a message into it. Both go through
@@ -1089,8 +1123,18 @@ Panel {
   }
   // A settings change has to land on the command line, and a running Process
   // will not pick up a new command: bounce it.
-  onNotifyOnMessageChanged: { watcherProc.running = false; restartTimer.restart() }
-  onSourceChanged: { watcherProc.running = false; restartTimer.restart() }
+  //
+  // The debounce exists for load-time cascades, where several settings change in the
+  // same breath and one restart is enough. A deliberate instance switch is not a
+  // cascade: waiting out five seconds of an old machine's bots reads as "it did not
+  // work", and the whole point of the picker is that the answer is immediate.
+  function bounceWatcher(immediate) {
+    watcherProc.running = false
+    restartTimer.interval = immediate ? 120 : 5000
+    restartTimer.restart()
+  }
+  onNotifyOnMessageChanged: bounceWatcher(false)
+  onSourceChanged: bounceWatcher(false)
 
   function parseState(text) {
     try {
@@ -1465,10 +1509,104 @@ Panel {
   }
 
   // auto follows Hermes Desktop's connection; local pins the bar to this machine.
+  // Kept for the IPC probe; `s` opens the picker, which does the same thing with the
+  // choice visible.
   function cycleSource() {
     source = source === "auto" ? "local" : "auto"
-    Quickshell.execDetached(["omarchy", "bar", "set", "ozz1ee.hermbot", "source", source])
+    Quickshell.execDetached(["omarchy", "bar", "set", "ozz1ee.hermbot", "instance", source])
+    bounceWatcher(true)
     cursor = 0
+  }
+
+  // ---- the instance picker --------------------------------------------------
+  // Which instance the roster is read from is the one setting that can make the panel
+  // show a different machine's bots without anything on screen changing shape, so it
+  // is chosen from a list that names them, not cycled blind. `s` opens it; the entry
+  // in force is where the cursor starts, so Enter alone keeps the current choice and
+  // the picker always answers "where am I" as well as "where could I go".
+  property bool instOpen: false
+  property int instCursor: 0
+  readonly property var instances: snap && snap.instances ? snap.instances : []
+  // The instance actually in use. `source` is the pin (auto / local / ssh:<id>); the
+  // snapshot names what the poll really came from. On "auto" those differ whenever the
+  // app itself sits on another machine, and the list has no "auto" row to mark - it
+  // marks the named instance the pin resolves to, so the list always says where the
+  // roster came from.
+  readonly property string activeInstance: {
+    var want = String(source)
+    return want === "auto" ? String(snap && snap.source ? snap.source : "") : want
+  }
+
+  function openInstances() {
+    // Opening the list implies being able to see it: from the bar the panel may be
+    // closed, and a picker that sets state nobody can look at is not open.
+    if (!opened) open()
+    // The cursor starts on the instance in use, which is what makes Enter alone a
+    // no-op rather than a change.
+    var want = activeInstance
+    instCursor = 0
+    for (var i = 0; i < instances.length; i++) {
+      if (String(instances[i].value) === want) instCursor = i
+    }
+    instOpen = true
+  }
+
+  function closeInstances() {
+    instOpen = false
+    cursor = 0
+  }
+
+  function moveInstCursor(dy) {
+    if (!instances.length) return
+    instCursor = Math.max(0, Math.min(instances.length - 1, instCursor + dy))
+  }
+
+  // The chosen value goes back verbatim: the watcher already accepts `auto`, `local`
+  // and `ssh:<id>`, so nothing here has to know what an address is.
+  function pickInstance(value) {
+    var next = String(value || "")
+    if (!next) return
+    // Only ever persist a value the list actually offered. The list arrives with the
+    // snapshot, and on a remote source the watcher runs on THAT machine and reads ITS
+    // connection registry - so an entry can name an address this install cannot reach.
+    // Writing one would leave every later switch looking like it did nothing.
+    var known = next === "auto"
+    for (var i = 0; i < instances.length; i++) {
+      if (String(instances[i].value) === next) known = true
+    }
+    if (!known) return
+    source = next
+    Quickshell.execDetached(["omarchy", "bar", "set", "ozz1ee.hermbot", "instance", next])
+    // Straight away, not after the debounce: the assignment above already queued a
+    // five-second bounce, and this one replaces it.
+    bounceWatcher(true)
+    instOpen = false
+    cursor = 0
+  }
+
+  // What the picker looks like right now, as JSON. Shared with the IPC probe so the
+  // state that is checked and the state that is shown cannot drift apart.
+  function instancesJson() {
+    return JSON.stringify({ source: source, open: instOpen, cursor: instCursor,
+                            count: instances.length, choices: instances })
+  }
+
+  // The badge that carries the NUMBER belongs to the conversation it is about, not to
+  // the bot. The desktop marks a session, not a bot, and the count is measured against
+  // one conversation - so a number sitting on the bot row has no subject: it says a bot
+  // wants you without saying which chat. It therefore rides the row whose session IS the
+  // one the count was measured against, and falls back to the bot row whenever that
+  // session has no row of its own - so a waiting bot is never silent, and the number is
+  // never shown twice.
+  function rowCarriesCount(row) {
+    if (!row || !row.bot || !row.bot.waiting) return false
+    var measured = String(((row.bot.recent_session || {}).session_id) || "")
+    if (row.kind === "bot") {
+      var attached = String(((row.bot.attach || {}).session_id) || "")
+      return attached === "" || attached !== measured
+    }
+    var sid = String((row.session || {}).session_id || "")
+    return sid !== "" && sid === measured
   }
 
   // Enter lands on whatever the cursor is on: a bot opens the bot, a session row
@@ -1607,6 +1745,25 @@ Panel {
                               wrap: Math.round(turns.width),
                               drag: root.dragWrap })
     }
+    // The roster's grips, driven from outside so the resize can be checked without a
+    // mouse - the same reason the chat has its own probe. "Sized by hand" is reported
+    // too, because a list that is content-sized and a list that was dragged to exactly
+    // its content height measure the same, and only one of them scrolls on the next
+    // message. Zeroes put it back to following its content.
+    function resizeRoster(w: real, h: real): string {
+      if (w === 0 && h === 0) {
+        root.rosterSizedByHand = false
+      } else {
+        if (w > 0) root.rosterWidth = root.clampRosterWidth(w)
+        if (h > 0) root.rosterHeight = root.clampRosterHeight(h)
+        root.rosterSizedByHand = true
+      }
+      return JSON.stringify({ x: panel.cardOrigin.x, y: panel.cardOrigin.y,
+                              w: panel.contentWidth, h: panel.contentHeight,
+                              rosterW: Math.round(root.rosterWidth),
+                              rosterH: Math.round(root.rosterHeight),
+                              handsized: root.rosterSizedByHand })
+    }
     // Drive the font scale from outside, and report both the panel's computed sizes and
     // the bar label's - the second must NOT move, or the setting has leaked out of the
     // window into the bar.
@@ -1655,10 +1812,36 @@ Panel {
       return x + "," + y
     }
     function away(): string { keyCatcher.pointerGone(); return "away" }
+    // What the roster actually built, and which row this code believes should carry the
+    // number. Diagnostics: a badge in the wrong place is a disagreement between these
+    // fields, and reading them beats guessing which of the two is wrong.
+    function rows(): string {
+      var out = []
+      for (var i = 0; i < root.rows.length; i++) {
+        var r = root.rows[i]
+        var b = r.bot || {}
+        out.push({ i: i, kind: r.kind, bot: b.name || "",
+                   sid: String((r.session || {}).session_id || ""),
+                   waiting: !!b.waiting,
+                   measured: String((b.recent_session || {}).session_id || ""),
+                   attached: String((b.attach || {}).session_id || ""),
+                   carries: root.rowCarriesCount(r) })
+      }
+      return JSON.stringify(out)
+    }
     function state(): string {
       return JSON.stringify({ counts: root.counts, gateway: root.gateway, bots: root.bots.length,
         barEdge: root.barEdge, barAvatars: barAvatarModel.count })
     }
+    // The instance picker, drivable from outside. It is the one control that changes
+    // which machine answers, and a probe has no keyboard: without these the feature
+    // could only be checked by hand, which is exactly how the last one shipped
+    // broken.
+    function instances(): string { return root.instancesJson() }
+    function openInstances(): string { root.openInstances(); return root.instancesJson() }
+    function moveInstances(dy: int): string { root.moveInstCursor(dy); return root.instancesJson() }
+    function pickInstance(value: string): string { root.pickInstance(String(value)); return root.instancesJson() }
+    function closeInstances(): string { root.closeInstances(); return root.instancesJson() }
   }
 
   // ---------------------------------------------------------------- helpers
@@ -1737,7 +1920,8 @@ Panel {
     if (!snap) return "Hermbot"
     if (!gatewayUp) return "Hermes: gateway not running"
     var c = counts
-    var text = (c.bots || 0) + " bots · " + (c.waiting || 0) + " waiting on you · "
+    var text = ((c.bots || 0) === 1 ? "1 bot" : (c.bots || 0) + " bots")
+               + " · " + (c.waiting || 0) + " waiting on you · "
       + (c.active || 0) + " active · " + root.unreadBots + " unread"
     if ((c.no_chat || 0) > 0) text += " · " + c.no_chat + " without a chat"
     return text
@@ -1965,14 +2149,31 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    // The chat wants room to read and type in; the roster is a list and stays
-    // narrow. Both are clamped to what the screen actually offers.
-    contentWidth: panel.fittedContentWidth(root.chat !== null ? root.chatWidth : Style.space(470))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight + Style.space(2), Style.space(930))
-
+    // The chat wants room to read and type in; the roster is a list and stays narrow
+    // until a hand says otherwise - both are dragged by the same grips, and either width
+    // is clamped to what the screen actually offers. The chat's height is always its own
+    // content (its log height); the roster's is its content until it has been sized by
+    // hand, and from then on the height itself, with the list scrolling inside it.
+    contentWidth: panel.fittedContentWidth(root.chat !== null ? root.chatWidth : root.rosterWidth)
+    contentHeight: root.chat === null && root.rosterSizedByHand
+                     ? panel.fittedContentHeight(root.rosterHeight, Style.space(930))
+                     : panel.fittedContentHeight(column.implicitHeight + footer.height
+                                                 + Style.space(2),
+                                                 Style.space(930))
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+
+      // Ctrl+= / Ctrl+- / Ctrl+0, the only text-size keys, in both modes and while
+      // typing. They live INSIDE the catcher: its children are plain objects rather than
+      // items, so a Shortcut is allowed here, and a Shortcut is resolved by the window
+      // itself instead of by bubbling a key event up an ancestor chain - which is what
+      // makes it work in this panel's own surface. One mechanism for both modes also
+      // means the composer needs no copy of the chords.
+      Shortcut { sequence: "Ctrl+="; onActivated: root.bumpFont(root.fontStep) }
+      Shortcut { sequence: "Ctrl++"; onActivated: root.bumpFont(root.fontStep) }
+      Shortcut { sequence: "Ctrl+-"; onActivated: root.bumpFont(-root.fontStep) }
+      Shortcut { sequence: "Ctrl+0"; onActivated: root.resetFont() }
       // While the message box holds the keys they are its own: this handler claims
       // j/k/h/l, space, x and Enter, so an unblocked catcher would eat every letter
       // of what you type. This is the upstream panel-editor pattern.
@@ -1980,27 +2181,38 @@ Panel {
 
       onMoveRequested: function(dx, dy) {
         if (dx < 0) root.scrub = !root.scrub
-        if (dy !== 0) root.moveCursor(dy)
+        if (dy !== 0) { if (root.instOpen) root.moveInstCursor(dy); else root.moveCursor(dy) }
       }
-      onActivateRequested: root.activateRow(root.cursor)
-      // Esc means "back out of one thing", never "throw everything away". With the
-      // browser unfolded it closes the browser and leaves the conversation alone;
-      // a second Esc then closes the chat, which is what the footer promises.
-      onCloseRequested: if (root.pickerOpen) root.closePicker(); else root.close()
+      onActivateRequested: {
+        if (root.instOpen) root.pickInstance((root.instances[root.instCursor] || {}).value)
+        else root.activateRow(root.cursor)
+      }
+      // Esc means "back out of one thing", never "throw everything away". The instance
+      // list is the outermost thing that can be open, so it goes first; then the
+      // browser unfolds and the conversation is left alone, and only a third Esc
+      // closes the chat, which is what the footer promises.
+      onCloseRequested: if (root.instOpen) root.closeInstances()
+                        else if (root.pickerOpen) root.closePicker(); else root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "r") root.cycleBarMetric()
         else if (t === "g" || t === "G") root.cycleOrdering()
         else if (t === "p" || t === "P") root.togglePinned()
-        else if (t === "s" || t === "S") root.cycleSource()
+        // A list that names the instances, not a blind toggle: which machine the roster
+        // comes from is too load-bearing a choice to make by cycling.
+        else if (t === "s" || t === "S") {
+          // The picker is drawn on the roster, so from a conversation come back to it
+          // first: a key that looks dead is worse than one that changes the view.
+          if (root.chat !== null) root.closeChat()
+          root.openInstances()
+        }
         else if (t === "o" || t === "O") root.openRowInDesktop(root.cursor)
         else if (t === "w" || t === "W") root.toggleWork()
         else if (t === "n" || t === "N") root.startNewChatForCursor()
-        // Bare here, not Ctrl-modified: the catcher only gets a key when the composer is
-        // NOT holding it, so a lone "+" in this mode has no other meaning to protect.
-        else if (t === "+" || t === "=") root.bumpFont(root.fontStep)
-        else if (t === "-" || t === "_") root.bumpFont(-root.fontStep)
-        else if (t === "0") root.resetFont()
+        // Text size is Ctrl+= / Ctrl+- / Ctrl+0 in BOTH modes, handled by the widget's
+        // own key handler - the catcher only ever hands over the character itself, so a
+        // bare "+" here could not tell a text-size request from anything else, and next
+        // to a list you walk with single letters it read as "make the window bigger".
       }
 
       // Where the pointer is, in panel coordinates. Avatars map it into their
@@ -2039,7 +2251,14 @@ Panel {
 
       Flickable {
         id: panelFlick
-        anchors.fill: parent
+        // The list stops where the footer starts: the footer is pinned to the card's
+        // bottom edge, not to the end of the content, so a card that was dragged taller
+        // than its list keeps the hint lines on the bottom edge instead of leaving them
+        // hanging in the middle with empty space under them.
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.bottom: footer.top
         contentWidth: width
         // Exactly the column. The card already carries popupPadding on every side,
         // and slack here stacked on top of it: the gap under the footer came to more
@@ -2073,9 +2292,16 @@ Panel {
                   if (root.sourceError) return "HERMBOT · " + root.sourceError
                   if (root.sourceWarning) return "HERMBOT · " + root.sourceWarning + " · local only"
                   if (!root.gatewayUp) return "HERMBOT · gateway down"
-                  if (root.remoteSource) return "HERMBOT · " + root.instanceLabel
+                  // The instance is named in EVERY state, not only when it is remote:
+                  // which machine the roster comes from is the one thing the list
+                  // cannot show by itself, and a pinned source is called out because it
+                  // stops following the app - the difference between "auto" and a pin
+                  // is invisible until the app moves and the widget does not.
+                  var where = root.instanceLabel || "this device"
+                  var pinned = String(root.source) !== "auto" ? " · pinned" : ""
                   var profiles = root.gateway.profiles
-                  return "HERMBOT · " + (profiles ? profiles.length : 0) + " profiles"
+                  return "HERMBOT · " + where + pinned + " · "
+                         + (profiles ? profiles.length : 0) + " profiles"
                 }
                 color: root.sourceError ? root.urgent : root.dim
                 font.family: root.fontFamily
@@ -2086,7 +2312,7 @@ Panel {
                 visible: root.snap !== null
                 text: {
                   var c = root.counts
-                  var bits = [(c.bots || 0) + " bots"]
+                  var bits = [(c.bots || 0) === 1 ? "1 bot" : (c.bots || 0) + " bots"]
                   if ((c.waiting || 0) > 0) bits.push(c.waiting + " waiting on you")
                   if ((c.active || 0) > 0) bits.push(c.active + " active")
                   if (root.unreadBots > 0) bits.push(root.unreadBots + " unread")
@@ -2615,20 +2841,10 @@ Panel {
                     root.sendChat()
                     event.accepted = true
                   }
+                  // Text size while typing is the panel's own Shortcuts now: this field
+                  // used to carry its own copy of the chords, and two mechanisms for one
+                  // press would step the size twice.
                   Keys.onEscapePressed: root.pickerOpen ? root.closePicker() : root.closeChat()
-                  // The catcher is blocked while this field holds the keys, so Ctrl+= and
-                  // Ctrl+- would otherwise only work while reading, never while typing -
-                  // which is exactly when you notice the text is too small.
-                  Keys.onPressed: function(event) {
-                    if (!(event.modifiers & Qt.ControlModifier)) return
-                    if (event.key === Qt.Key_Plus || event.key === Qt.Key_Equal) {
-                      root.bumpFont(root.fontStep); event.accepted = true
-                    } else if (event.key === Qt.Key_Minus) {
-                      root.bumpFont(-root.fontStep); event.accepted = true
-                    } else if (event.key === Qt.Key_0) {
-                      root.resetFont(); event.accepted = true
-                    }
-                  }
                   onVisibleChanged: if (visible) chatFocus.restart()
                 }
 
@@ -2886,6 +3102,69 @@ Panel {
             }
           }
 
+          // ---- instances
+          // The picker lives in the panel body, not in a dropdown: the panel has one
+          // idiom for "choose from a list" and this is it. The entry in force is marked
+          // and where the cursor starts, so Enter can keep the current choice - the list
+          // answers "where am I" as well as "where could I go", which the old blind
+          // toggle never did.
+          Repeater {
+            id: instanceList
+            model: root.instances
+
+            Rectangle {
+              required property var modelData
+              required property int index
+              width: column.width
+              visible: root.instOpen && root.chat === null
+              height: !visible ? 0 : Style.space(34)
+              color: root.instCursor === index ? root.faint : "transparent"
+
+              // The rows answer the mouse, the way the roster's do: hovering moves the
+              // cursor and a click picks. Without this the list was keyboard-only, which
+              // is a strange thing to hand someone in a panel they open with a mouse.
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                onEntered: root.instCursor = index
+                onClicked: root.pickInstance(modelData.value)
+              }
+
+              Row {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: Style.space(12)
+                anchors.rightMargin: Style.space(12)
+                spacing: Style.space(8)
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: Style.space(16)
+                  text: String(modelData.value) === String(root.activeInstance) ? "✓" : ""
+                  color: root.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(Style.font.bodySmall)
+                }
+                Text {
+                  textFormat: Text.PlainText
+                  text: root.label(String(modelData.label || ""))
+                  color: String(modelData.value) === String(root.activeInstance) ? root.fg : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(Style.font.bodySmall)
+                  font.bold: String(modelData.value) === String(root.activeInstance)
+                }
+                Text {
+                  textFormat: Text.PlainText
+                  text: root.label(String(modelData.note || ""))
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(Style.font.caption)
+                }
+              }
+            }
+          }
+
           // ---- rows
           Repeater {
             id: repeater
@@ -2896,10 +3175,10 @@ Panel {
               required property var modelData
               required property int index
               width: column.width
-              // The roster stands down while a conversation is open. A Repeater
-              // parents its delegates to its PARENT, not to itself, so hiding the
-              // Repeater would not have hidden these.
-              visible: root.chat === null
+              // The roster stands down while a conversation is open, and while the
+              // instance list is up. A Repeater parents its delegates to its PARENT, not
+              // to itself, so hiding the Repeater would not have hidden these.
+              visible: root.chat === null && !root.instOpen
               height: !visible ? 0
                     : modelData.kind === "section" || modelData.kind === "pinnedHeader" ? Style.space(26)
                     : modelData.kind === "pinnedAgent" ? Style.space(20)
@@ -3151,29 +3430,36 @@ Panel {
                     }
                   }
 
-                  Column {
+                  Row {
                     id: badge
                     anchors.verticalCenter: parent.verticalCenter
-                    width: Style.space(38)
-                    spacing: Style.space(2)
+                    // A Row takes an implicit width from its children and NOTHING in the
+                    // row's layout gives it any room: the name and the preview claim the
+                    // line, so the badge was squeezed to zero width.
+                    width: implicitWidth
+                    spacing: Style.space(6)
 
-                    Text {
-                      textFormat: Text.PlainText
-                      anchors.right: parent.right
-                      text: modelData.kind === "bot" ? root.fmtAgo(root.lastActivity(modelData.bot)) : ""
-                      color: root.dim
-                      font.family: root.fontFamily
-                      font.pixelSize: root.fs(Style.font.caption)
-                    }
+                    // The count where the conversation is, a plain dot everywhere else:
+                    // the number rides the row whose chat it counts, and the dot marks
+                    // the other session rows the desktop paints green. `chat.unread`
+                    // alone is never true here: it is the backend watermark, which
+                    // nothing stamps.
+                    //
+                    // Inline with the time, not stacked above it. These two were a
+                    // Column, so the pill was laid out on a second line - and a row is
+                    // exactly one line tall, so it was clipped away every time. The
+                    // binding was true, the probe said the row carried the count, and
+                    // nothing could ever be seen.
                     Rectangle {
-                      anchors.right: parent.right
-                      // A count on the bot that is waiting on you - Rakabot's own
-                      // badge - and a dot on the session rows the desktop paints
-                      // green. `chat.unread` alone is never true here: it is the
-                      // backend watermark, which nothing stamps.
-                      visible: modelData.kind === "bot" ? !!modelData.bot.waiting
-                             : (modelData.kind === "attach" || modelData.kind === "pinned")
-                               ? !!(modelData.session || {}).unread : false
+                      anchors.verticalCenter: parent.verticalCenter
+                      // The condition is inline and reads plain fields on purpose. A
+                      // call to `rowCarriesCount(modelData)` here evaluated against an
+                      // object with no notify signals: it was true when asked from the
+                      // root and false in the delegate that actually paints the row, so
+                      // the pill existed, was "visible", and never appeared.
+                      visible: !!(modelData.bot && modelData.bot.waiting)
+                             || ((modelData.kind === "attach" || modelData.kind === "pinned")
+                                 && !!(modelData.session || {}).unread)
                       width: Math.max(Style.space(14), unreadText.implicitWidth + Style.space(6))
                       height: Style.space(14)
                       radius: height / 2
@@ -3184,12 +3470,21 @@ Panel {
                         anchors.centerIn: parent
                         // The watcher's count of messages since the app last had
                         // this chat read, so a wide number widens the pill.
-                        text: modelData.kind === "bot"
-                          ? String(modelData.bot.unread_count || 1) : "\u2022"
+                        text: (modelData.bot && modelData.bot.waiting)
+                          ? String((modelData.bot || {}).unread_count || 1) : "\u2022"
                         color: Color.background
                         font.family: root.fontFamily
                         font.pixelSize: root.fs(Style.font.caption)
                       }
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: modelData.kind === "bot" ? root.fmtAgo(root.lastActivity(modelData.bot)) : ""
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fs(Style.font.caption)
                     }
                   }
                 }
@@ -3232,60 +3527,65 @@ Panel {
           Rectangle { width: parent.width; height: 1; color: root.faint; visible: root.bots.length > 0 && root.chat === null }
 
 
-          // ---- footer
-          // Two lines, not one. The list of keys is longer than the card is wide, and
-          // a single line could only ever be elided. The split is by ROLE: what you
-          // press to act, and what the panel is currently set to - so the second line
-          // doubles as a readout. The keys are bolded so the eye finds them, and `h`
-          // is gone: it was advertised here and had no handler anywhere.
-          Item {
-            id: footer
+        }
+      }
+
+      // ---- footer
+      // Pinned to the card's bottom edge and outside the list: it is a caption for the
+      // whole window, not the last row of the list, so a card dragged taller than its
+      // content keeps it where the eye expects it. Two lines, not one - the key list is
+      // longer than the card is wide and a single line could only ever be elided. The
+      // split is by ROLE: what you press to act, and what the panel is currently set to,
+      // so the second line doubles as a readout. The keys are bolded so the eye finds
+      // them, and `h` is gone: it was advertised here and had no handler anywhere.
+      Item {
+        id: footer
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        visible: root.chat === null
+        height: visible ? Style.space(30) : 0
+
+        // Values here are our own enum settings, never user content, so this line
+        // may carry markup. The transcript never does.
+        readonly property string actLine: "<b>j/k</b> move · <b>⏎</b> open · <b>o</b> desktop · <b>n</b> new "
+                                          + (root.newBot !== "" ? root.newBot : "chat")
+        readonly property string showLine: "<b>g</b> " + root.ordering + " · <b>p</b> pinned · <b>s</b> "
+                                           + root.source + " · <b>r</b> " + root.barMetric
+                                           + " · <b>ctrl +/-</b> text " + Math.round(root.fontScale * 100) + "%"
+
+        // The two lines are centred as a block and within themselves, so the footer
+        // reads as a caption under the card rather than a column of left-hugging text.
+        // The width follows the longer line, clamped to the card, so a narrow theme
+        // still elides instead of overflowing.
+        Column {
+          anchors.horizontalCenter: parent.horizontalCenter
+          anchors.verticalCenter: parent.verticalCenter
+          width: Math.min(Math.max(actText.implicitWidth, showText.implicitWidth),
+                          parent.width)
+          spacing: Style.space(1)
+
+          Text {
+            id: actText
+            textFormat: Text.RichText
             width: parent.width
-            visible: root.chat === null
-            height: visible ? Style.space(30) : 0
-
-            // Values here are our own enum settings, never user content, so this line
-            // may carry markup. The transcript never does.
-            readonly property string actLine: "<b>j/k</b> move · <b>⏎</b> open · <b>o</b> desktop · <b>n</b> new "
-                                              + (root.newBot !== "" ? root.newBot : "chat")
-            readonly property string showLine: "<b>g</b> " + root.ordering + " · <b>p</b> pinned · <b>s</b> "
-                                               + root.source + " · <b>r</b> " + root.barMetric
-                                               + " · <b>+/-</b> text " + Math.round(root.fontScale * 100) + "%"
-
-            // The two lines are centred as a block and within themselves, so the
-            // footer reads as a caption under the card rather than a column of
-            // left-hugging text. The width follows the longer line, clamped to the
-            // card, so a narrow theme still elides instead of overflowing.
-            Column {
-              anchors.horizontalCenter: parent.horizontalCenter
-              anchors.verticalCenter: parent.verticalCenter
-              width: Math.min(Math.max(actText.implicitWidth, showText.implicitWidth),
-                              parent.width)
-              spacing: Style.space(1)
-
-              Text {
-                id: actText
-                textFormat: Text.RichText
-                width: parent.width
-                horizontalAlignment: Text.AlignHCenter
-                elide: Text.ElideRight
-                text: footer.actLine
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(Style.font.caption)
-              }
-              Text {
-                id: showText
-                textFormat: Text.RichText
-                width: parent.width
-                horizontalAlignment: Text.AlignHCenter
-                elide: Text.ElideRight
-                text: footer.showLine
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(Style.font.caption)
-              }
-            }
+            horizontalAlignment: Text.AlignHCenter
+            elide: Text.ElideRight
+            text: footer.actLine
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(Style.font.caption)
+          }
+          Text {
+            id: showText
+            textFormat: Text.RichText
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            elide: Text.ElideRight
+            text: footer.showLine
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(Style.font.caption)
           }
         }
       }
@@ -3408,6 +3708,123 @@ Panel {
           textFormat: Text.PlainText
           text: "◢"
           color: gripCorner.containsMouse ? root.accent : root.faint
+          font.family: root.fontFamily
+          font.pixelSize: root.fs(Style.font.caption)
+        }
+      }
+
+      // ---- resizing the roster ------------------------------------------------
+      // The same three grips as the conversation above, on the same card, driving the
+      // roster's own size. Only one mode's grips are ever visible, so a drag can never
+      // mean two things. The first touch on the bottom edge or the corner takes the
+      // card's current height as the starting point: until then the roster is sized by
+      // its list, and adopting whatever it happens to be keeps the first drag seamless
+      // instead of snapping to some remembered number.
+      MouseArea {
+        id: gripRosterRight
+        visible: root.chat === null
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        width: Style.space(7)
+        height: parent.height - Style.space(80)
+        hoverEnabled: true
+        preventStealing: true
+        cursorShape: Qt.SizeHorCursor
+        property real startW: 0
+        property real startGX: 0
+        onPressed: function(mouse) {
+          startW = root.rosterWidth
+          startGX = gripRosterRight.mapToGlobal(mouse.x, mouse.y).x
+        }
+        onPositionChanged: function(mouse) {
+          if (!pressed) return
+          var dx = gripRosterRight.mapToGlobal(mouse.x, mouse.y).x - startGX
+          root.rosterWidth = root.clampRosterWidth(startW + dx * 2)
+        }
+        Rectangle {
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          width: 2
+          height: Style.space(26)
+          radius: 1
+          color: gripRosterRight.containsMouse ? root.accent : root.faint
+        }
+      }
+
+      MouseArea {
+        id: gripRosterBottom
+        visible: root.chat === null
+        anchors.bottom: parent.bottom
+        anchors.horizontalCenter: parent.horizontalCenter
+        height: Style.space(7)
+        width: parent.width - Style.space(80)
+        hoverEnabled: true
+        preventStealing: true
+        cursorShape: Qt.SizeVerCursor
+        property real startH: 0
+        property real startGY: 0
+        onPressed: function(mouse) {
+          if (!root.rosterSizedByHand) {
+            root.rosterHeight = root.clampRosterHeight(column.implicitHeight + Style.space(2))
+            root.rosterSizedByHand = true
+          }
+          startH = root.rosterHeight
+          startGY = gripRosterBottom.mapToGlobal(mouse.x, mouse.y).y
+        }
+        onPositionChanged: function(mouse) {
+          if (!pressed) return
+          var dy = gripRosterBottom.mapToGlobal(mouse.x, mouse.y).y - startGY
+          root.rosterHeight = root.clampRosterHeight(startH + dy)
+        }
+        Rectangle {
+          anchors.bottom: parent.bottom
+          anchors.horizontalCenter: parent.horizontalCenter
+          height: 2
+          width: Style.space(26)
+          radius: 1
+          color: gripRosterBottom.containsMouse ? root.accent : root.faint
+        }
+      }
+
+      MouseArea {
+        id: gripRosterCorner
+        visible: root.chat === null
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        width: Style.space(16)
+        height: Style.space(16)
+        hoverEnabled: true
+        preventStealing: true
+        cursorShape: Qt.SizeFDiagCursor
+        property real startW: 0
+        property real startH: 0
+        property real startGX: 0
+        property real startGY: 0
+        onPressed: function(mouse) {
+          if (!root.rosterSizedByHand) {
+            root.rosterHeight = root.clampRosterHeight(column.implicitHeight + Style.space(2))
+            root.rosterSizedByHand = true
+          }
+          startW = root.rosterWidth
+          startH = root.rosterHeight
+          var p = gripRosterCorner.mapToGlobal(mouse.x, mouse.y)
+          startGX = p.x
+          startGY = p.y
+        }
+        onPositionChanged: function(mouse) {
+          if (!pressed) return
+          var p = gripRosterCorner.mapToGlobal(mouse.x, mouse.y)
+          root.rosterWidth = root.clampRosterWidth(startW + (p.x - startGX) * 2)
+          root.rosterHeight = root.clampRosterHeight(startH + (p.y - startGY))
+        }
+        Text {
+          anchors.right: parent.right
+          anchors.bottom: parent.bottom
+          anchors.rightMargin: Style.space(2)
+          anchors.bottomMargin: Style.space(1)
+          textFormat: Text.PlainText
+          text: "◢"
+          color: gripRosterCorner.containsMouse ? root.accent : root.faint
           font.family: root.fontFamily
           font.pixelSize: root.fs(Style.font.caption)
         }

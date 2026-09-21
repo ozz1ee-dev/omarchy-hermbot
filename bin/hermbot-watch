@@ -473,20 +473,37 @@ def _merge_seen(out, value):
                 bucket["seen"][sid] = n
 
 
-def session_is_unread(state, profile, session_id, message_count):
+def session_is_unread(state, profile, session_id, message_count, panel=None):
     """Is one session unread by the desktop's own record?
 
-    Explicitly marked wins; otherwise the chat is unread once its message count
-    has moved past the count the desktop last acknowledged seeing.
+    Two records decide it, and this window's own watermark is NOT one of them: a
+    watermark of ours that is merely behind would make every chat we ever showed read as
+    waiting for ever, which is the badge that could not be cleared. What counts is the
+    desktop's mark - a chat whose turn finished while you were not looking - and the
+    desktop's own acknowledgement count, when it keeps one.
+
+    The exception runs the other way: if THIS window has shown the conversation at its
+    current length, the mark has been answered and the chat is not waiting any more. That
+    is what makes reading a chat here clear its badge, the same way reading it in the app
+    clears it there.
     """
     bucket = (state or {}).get(profile)
     if not bucket or not session_id:
         return False
+    seen_here = as_int((panel or {}).get(str(session_id), 0))
     if session_id in bucket["marked"]:
-        return True
+        # A mark is answered by this window showing the conversation at its current
+        # length - reading it here is reading it.
+        return seen_here < as_int(message_count or 0)
     baseline = bucket["seen"].get(session_id)
     if baseline is None:
-        return False
+        # Nothing to measure against: the app keeps no watermark for this session. This
+        # window's own stamp is then the only record, and a chat it has shown is read up
+        # to that length - the gap past it is what arrived since. With neither record,
+        # not unread: the same default the app takes when its watermark is missing.
+        if seen_here <= 0:
+            return False
+        return as_int(message_count or 0) > seen_here
     try:
         return int(message_count or 0) > int(baseline)
     except (TypeError, ValueError):
@@ -875,13 +892,18 @@ def session_holder(home, session_id):
         expires_at = float(row[1] or 0)
     except (TypeError, ValueError):
         return ""
-    if expires_at <= time.time():
-        return ""
-    # A row whose owner died is a turn that is not running: the lease is only renewed
-    # while its process is alive, so a crash must not fence the session for the rest of
-    # the TTL. Unknown liveness still counts as alive, same rule as _owner_alive.
+    # The expiry is NOT what makes a session free. The row is created when a turn starts
+    # and deleted the moment it ends, and it is the row the write fence enforces - but its
+    # TTL is short (minutes) and nothing renews it, so a long turn outlives its own lease.
+    # Reading that as "free" sent a message into a session the backend was still holding:
+    # the write was refused, the CLI exited 1, and the window showed nothing because a
+    # turn it believed was over was still running. A lease that is past its expiry but
+    # whose owner is alive is a turn that is still going.
     m = re.search(r"pid=(\d+)", holder)
     if m and not os.path.exists("/proc/" + m.group(1)):
+        return ""
+    if not m and expires_at <= time.time():
+        # No owner to ask about, so the TTL is the only thing left to trust.
         return ""
     m = re.search(r"platform=([A-Za-z0-9_]+)", holder)
     return m.group(1) if m else "another surface"
@@ -1243,7 +1265,7 @@ def ssh_argv(target, remote_args):
     return argv
 
 
-def apply_local_waiting(snap, seen, appdata=None, counts=None):
+def apply_local_waiting(snap, seen, appdata=None, counts=None, panel=None):
     """Re-apply the widget's own "wrote and you have not looked" rule.
 
     The remote side of a stream computes waiting from ITS state directory, which
@@ -1265,7 +1287,7 @@ def apply_local_waiting(snap, seen, appdata=None, counts=None):
         # bot on a remote instance too - it is the same profile name the app keys
         # its own record on. Measured against the row a click can open, exactly as
         # the local path does: the hidden canonical chat has no door from the bar.
-        marked = session_is_unread(read_state, bot.get("name"), row_id, row_msgs)
+        marked = session_is_unread(read_state, bot.get("name"), row_id, row_msgs, panel)
         if marked:
             bot["desktop_unread"] = True
         # The desktop record exists only on the machine showing the bar, so the
@@ -1273,7 +1295,7 @@ def apply_local_waiting(snap, seen, appdata=None, counts=None):
         fallback = unseen and not desktop_available
         bot["waiting"] = bool(row_id and (marked or fallback))
         if bot["waiting"]:
-            baseline = unread_baseline(read_state, bot.get("name"), row_id, counts)
+            baseline = unread_baseline(read_state, bot.get("name"), row_id, counts, panel)
             bot["unread_count"] = (1 if baseline is None
                                    else max(1, as_int(row_msgs) - as_int(baseline)))
         else:
@@ -1289,7 +1311,7 @@ def written_after(wrote, seen_at):
     return bool(seen_at) and wrote > seen_at
 
 
-def snapshot(root, seen=None, appdata=None, counts=None):
+def snapshot(root, seen=None, appdata=None, counts=None, panel=None):
     """One roster snapshot.
 
     `seen` maps bot name -> when that bot's chat was last opened from the bar;
@@ -1308,7 +1330,9 @@ def snapshot(root, seen=None, appdata=None, counts=None):
     served = set(gw["profiles"])
     # The desktop's own read record (localStorage), keyed by profile. This is the
     # green dot the user actually sees: the backend watermark is never stamped by
-    # merely reading, so without this every row reads as read.
+    # merely reading, so without this every row reads as read. Our own window's
+    # watermark is passed alongside it, not merged into it: it answers a mark, it
+    # does not create one.
     read_state, desktop_available = desktop_read_state(appdata)
     bots = []
     for name, home_path in bot_homes(root):
@@ -1358,7 +1382,7 @@ def snapshot(root, seen=None, appdata=None, counts=None):
         # left its marker in place. Unread is therefore read from this row.
         unread_id = (recent or {}).get("session_id")
         unread_msgs = (recent or {}).get("message_count")
-        desktop_says_unread = session_is_unread(read_state, name, unread_id, unread_msgs)
+        desktop_says_unread = session_is_unread(read_state, name, unread_id, unread_msgs, panel)
         # The widget's own watermark is a stand-in only where the desktop keeps no
         # record at all. The desktop stamps its OWN watermark every time it shows a
         # session; ours is stamped only by a click on the bar - so trusting it next
@@ -1373,7 +1397,7 @@ def snapshot(root, seen=None, appdata=None, counts=None):
         # beats a fabricated count.
         unread_count = 0
         if waiting:
-            baseline = unread_baseline(read_state, name, unread_id, counts)
+            baseline = unread_baseline(read_state, name, unread_id, counts, panel)
             unread_count = (1 if baseline is None
                             else max(1, as_int(unread_msgs) - as_int(baseline)))
 
@@ -1533,7 +1557,7 @@ def count_baseline(counts, name, session_id):
     return entry["count"] if entry.get("id") == session_id else None
 
 
-def unread_baseline(read_state, name, session_id, counts):
+def unread_baseline(read_state, name, session_id, counts, panel=None):
     """How many messages were already seen in this conversation.
 
     The desktop's own record wins whenever it has one for this session: the app
@@ -1541,23 +1565,89 @@ def unread_baseline(read_state, name, session_id, counts):
     Our own baseline is only a fallback for the case the app keeps no record at all
     (a machine that never ran it) - and it must be for THIS session, or a count from
     a previous conversation would be subtracted from a different one.
+
+    This window's watermark joins in as the largest of the three: a conversation shown
+    here HAS been seen here, so it is the number a badge counts down from once the
+    desktop's mark has been answered. It never decides WHETHER there is a badge - that
+    is `session_is_unread`.
     """
     desktop = ((read_state or {}).get(name) or {}).get("seen") or {}
+    here = as_int((panel or {}).get(str(session_id), 0)) if session_id else 0
+    own = count_baseline(counts, name, session_id)
+    # Both of these are reads, so the furthest one wins - neither is authoritative over
+    # the other, and a count that dropped (compaction) must not be allowed to leave a
+    # higher stamp from whichever record still remembers the larger number.
+    reads = []
     if session_id and session_id in desktop:
-        return as_int(desktop[session_id])
-    return count_baseline(counts, name, session_id)
+        reads.append(as_int(desktop[session_id]))
+    if here > 0:
+        reads.append(here)
+    if own is not None:
+        reads.append(as_int(own))
+    return max(reads) if reads else None
 
 
-def save_seen(path, seen, counts=None):
+def save_seen(path, seen, counts=None, panel=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # A caller that only knows about the click record must not drop the other
-    # half: two records, two writers, one file.
+    # A caller that only knows about one of the records must not drop the others:
+    # three records, three writers, one file.
     if counts is None:
         counts = load_counts(path)
-    payload = {"updated_ts": time.time(), "bots": seen, "counts": counts}
+    if panel is None:
+        panel = load_panel_reads(path)
+    payload = {"updated_ts": time.time(), "bots": seen, "counts": counts, "panel": panel}
     hermbot_paths.atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2),
                                encoding="utf-8")
+
+
+def load_panel_reads(path):
+    """Per session: the message count this window has actually SHOWN.
+
+    The desktop stamps its own watermark only when the DESKTOP shows a conversation, so
+    a chat read in our chat window counted as unread for ever - 68 messages of it, and
+    the only thing that cleared it was switching the app to another instance and back,
+    which made the desktop re-stamp. This is that same rule applied to our own window:
+    shown here is read here. Kept apart from `counts` because that one is per bot and
+    names the session a click reaches, while this window can show any session at all.
+    """
+    panel = _load_seen_payload(path).get("panel")
+    if not isinstance(panel, dict):
+        return {}
+    out = {}
+    for sid, count in panel.items():
+        n = as_int(count)
+        if sid and n > 0:
+            out[str(sid)] = n
+    return out
+
+
+def stamp_panel_read(path, session_id, payload):
+    """Record that the chat window has shown this conversation, up to its count.
+
+    Called for every thread the window fetches, which is every poll while it is open -
+    so the watermark tracks the conversation exactly as it is being read, and stops the
+    moment the window closes, which is what makes it a read record rather than a "was
+    ever fetched" record.
+    """
+    if not session_id or not isinstance(payload, dict):
+        return
+    count = as_int(payload.get("message_count"))
+    if count <= 0:
+        return
+    handle = acquire_state_lock(path)
+    try:
+        panel = load_panel_reads(path)
+        # Set it, do not merely raise it. `sessions.message_count` can FALL - a session
+        # that gets compacted folds its messages and the count drops with them. A
+        # watermark that could only ever rise would then sit above every count the
+        # session will ever report again, and the badge would be dead for good: the
+        # number would never be allowed to exceed it.
+        if count != as_int(panel.get(str(session_id), 0)):
+            panel[str(session_id)] = count
+            save_seen(path, load_seen(path), panel=panel)
+    finally:
+        release_state_lock(handle)
 
 
 def mark_seen(path, name):
@@ -1597,20 +1687,22 @@ def seed_seen(path, snap):
 
 
 def sync_counts(path, snap):
-    """Keep the badge's baseline honest: seed it, then re-stamp it on every read.
+    """Give every bot a baseline, and keep it pointing at the right conversation.
 
-    The badge counts "messages in this chat since it last read as read". Two things
-    keep that number truthful:
+    The badge counts "messages in this chat since it was last read". Only READS move
+    that baseline, and there are two of them: this window showing the thread, and the
+    desktop's own watermark once the app has written one. This function does the
+    bookkeeping around them and nothing more:
 
-    * a bot with no baseline gets one at first sight, so the count starts at one
-      and grows with each new message rather than pinning at one forever;
-    * a chat that is NOT waiting has been read, so its baseline is re-stamped at
-      the current message count on every poll.
+    * a bot with no baseline gets one at first sight, so a fresh install does not paint
+      every bot as unread and the count starts at one rather than pinning there
+      forever;
+    * a bot that has moved to a different conversation gets its count reset, because a
+      number belonging to another chat cannot describe this one.
 
-    The second is what survives a chat read in the app window, where this widget's
-    own click record is never touched. The price of the first is that a bot which
-    is *already* waiting when the widget first sees it shows "1" - its real backlog
-    predates the only clock we have, and inventing that number would be a guess.
+    What it deliberately does NOT do is move the baseline when a bot stops waiting.
+    "No turn running" is not "read" - equating the two is what silently zeroed every
+    badge the moment a turn ended.
     """
     handle = acquire_state_lock(path)
     try:
@@ -1633,10 +1725,16 @@ def sync_counts(path, snap):
             # not looking. A baseline from another conversation is not kept: it would
             # be subtracted from a different row.
             same_session = isinstance(entry, dict) and entry.get("id") == session_id
-            if not same_session or not bot.get("waiting"):
-                if not same_session or entry.get("count") != count:
-                    counts[name] = {"id": session_id, "count": count}
-                    changed = True
+            if not same_session:
+                # Seed a bot we have no baseline for, and move the baseline when the
+                # bot has moved to a different conversation - a count belonging to
+                # another chat would be subtracted from a row it does not describe.
+                # Nothing else moves it. A chat that is not waiting has not
+                # necessarily been READ: all it means is that no turn is running. A
+                # rule that equated the two is what made every badge die the moment a
+                # turn ended, and no badge could ever be seen.
+                counts[name] = {"id": session_id, "count": count}
+                changed = True
         if changed:
             # Both writers share one file, so write the other half back untouched.
             save_seen(path, load_seen(path), counts)
@@ -1839,11 +1937,48 @@ def _source_label(target):
     return str(target.get("label") or target.get("host") or target.get("id") or "remote")
 
 
-def stamp(snap, kind, target):
-    """Name the instance this snapshot came from, for the panel's own header."""
+def instance_choices(appdata=None):
+    """Every instance this install can be pointed at, for the panel's picker.
+
+    Named instances only. "auto" - follow whatever Hermes Desktop is on - is not a row
+    because it is never a place of its own: it always resolves to one of these, so
+    offering it beside them said the same thing twice. It stays the default when
+    nothing has been pinned, and the panel marks whichever named instance that is
+    currently in use, so the list still answers "where am I" without a row for it.
+
+    Each entry carries the exact value to hand back as `--source`, so picking one is a
+    single assignment and nothing has to parse a label back into an address.
+    """
+    rows = [{"value": "local", "label": "This device", "kind": "local", "note": ""}]
+    try:
+        registry, _ = app_registry(appdata)
+    except Exception:  # noqa: BLE001 - the picker must not depend on the app agreeing
+        registry = {}
+    for row in ((registry or {}).get("connections") or []):
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get("id") or "")
+        kind = str(row.get("kind") or "")
+        # The local connection is already the "This device" entry above; listing it
+        # twice would offer the same thing under two names.
+        if not rid or kind in ("", "local"):
+            continue
+        rows.append({"value": f"{kind}:{rid}", "label": str(row.get("label") or rid),
+                     "kind": kind, "note": str(row.get("host") or "")})
+    return rows
+
+
+def stamp(snap, kind, target, appdata=None):
+    """Name the instance this snapshot came from, for the panel's own header.
+
+    The picker's list rides along with it: the panel is where the instance is chosen,
+    so it must never have to ask for the list separately and risk showing a picker for
+    a roster it is not on.
+    """
     label = "this device" if kind == "local" else (target.get("label") or target.get("host") or "remote")
     snap["source"] = "local" if kind == "local" else f"{kind}:{target.get('id') or target.get('host')}"
     snap["instance"] = label
+    snap["instances"] = instance_choices(appdata)
     if target.get("unsupported"):
         # The window is somewhere we cannot read: be explicit rather than let the
         # local roster pass for it.
@@ -2031,7 +2166,8 @@ def ssh_stream(args, target):
             except ValueError:
                 continue
             snap = apply_local_waiting(stamp(snap, "ssh", target), seen, args.appdata,
-                                       load_counts(args.seen))
+                                       load_counts(args.seen),
+                                       load_panel_reads(args.seen))
             settle(args, snap)
             if not args.once:
                 sync_counts(args.seen, snap)
@@ -2077,7 +2213,8 @@ def local_stream(args, kind, target):
     while True:
         try:
             snap = stamp(snapshot(root, load_seen(args.seen), args.appdata,
-                                  load_counts(args.seen)), kind, target)
+                                  load_counts(args.seen),
+                                  load_panel_reads(args.seen)), kind, target)
         except Exception as exc:  # never take the bar down with us
             err = {"generated_ts": time.time(), "error": "this device unreadable",
                    "error_detail": f"{type(exc).__name__}: {exc}",
@@ -2110,6 +2247,10 @@ def main(argv=None):
     ap.add_argument("--state", default=str(DEFAULT_STATE), help="notification state file")
     ap.add_argument("--notify", action="store_true", help="send omarchy notifications on transitions")
     ap.add_argument("--seen", default=str(DEFAULT_SEEN), help="last-opened watermark per bot")
+    ap.add_argument("--read-state", action="store_true",
+                    help="print Hermes Desktop's own read record and exit (diagnostics: "
+                         "shows which chats the app MARKS unread and the watermark it "
+                         "keeps, per profile)")
     ap.add_argument("--mark-seen", metavar="BOT",
                     help="record that this bot was just opened, then exit (used by hermbot-open)")
     ap.add_argument("--hermes-root", default=os.environ.get("HERMBOT_ROOT", str(DEFAULT_ROOT)))
@@ -2134,11 +2275,25 @@ def main(argv=None):
         mark_seen(args.seen, args.mark_seen.lstrip("@").strip())
         return 0
 
+    if args.read_state:
+        state, available = desktop_read_state(args.appdata)
+        print(json.dumps(
+            {"available": available,
+             "profiles": {name: {"marked": sorted(str(i) for i in bucket.get("marked", [])),
+                                 "seen": bucket.get("seen", {})}
+                          for name, bucket in sorted(state.items())}},
+            ensure_ascii=False, indent=2 if args.pretty else None))
+        return 0
+
     if args.thread:
         kind, target = source_of(args)
         if kind == "ssh":
             return ssh_thread(args, target)
         payload = thread_payload(Path(args.hermes_root), args.thread, args.limit, args.work)
+        # Fetching a thread IS the window showing it, which is the same rule the desktop
+        # applies to itself when it opens a conversation - so the badge clears for a chat
+        # read here, instead of waiting for the app to be switched away and back.
+        stamp_panel_read(args.seen, args.thread, payload)
         print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
         return 0
 

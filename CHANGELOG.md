@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.7.0
+
+- **Pick the instance from the panel.** `s` opens a list of every instance this install
+  can be pointed at - this device, and each SSH connection Hermes Desktop knows - with
+  the one in force marked and under the cursor, so Enter alone keeps it. `j`/`k` walk it,
+  a click picks, `Esc` backs out. It replaces a blind toggle between two states with a
+  list that names them.
+- **The header names the instance, always.** Which machine the roster came from is the
+  one thing the list cannot show by itself, and a pinned source is now called pinned -
+  the difference between following the app and being pinned to a host is invisible until
+  the app moves and the widget does not.
+- **A switched instance answers immediately.** The watcher is bounced 120ms after a
+  deliberate switch instead of waiting out the five-second debounce that exists for
+  load-time cascades. Measured end to end: 344ms to the local roster, 924ms to a remote
+  one - and the second is SSH agreeing to talk, not something waiting.
+- **`1 bot`, not `1 bots`.**
+
+### Fixed
+
+- **A turn that outlives its own lease no longer looks like a free session.** A turn
+  lease carries a seven-minute expiry and nothing renews it, so a long turn read as
+  expired: the widget treated the session as free, sent into it, the backend refused with
+  exit code 1, and the window said nothing - because the turn it believed was over was
+  still running. The presence of the lease plus a live owner is what counts now, and the
+  expiry is a fallback only for a row with no pid to ask about.
+- **The unread count can no longer be stuck above every future count.** A session's
+  message count FALLS when it is compacted, and the panel's watermark could only ever
+  rise, so it sat above every count the session would report again and the badge was dead
+  for good. It is set now, not merely raised.
+- **The unread count stops clearing itself.** A chat that was not waiting was treated as
+  a chat that had been read, so every badge died the moment a turn ended. Only reads move
+  the mark: this window showing the thread, and the desktop's own watermark.
+- **The badge is drawn where it can be seen.** It was laid out on a second line of a
+  fixed-height row and clipped away every time - the binding said visible, the probe said
+  the row carried the count, and nothing appeared on screen. It sits inline with the
+  row's time now.
+- **The setting is `instance`, not `source`.** A bar item already has a `source` field -
+  the widget's own QML path - and a setting written under that name replaced the path,
+  after which the shell had nothing to load and the plugin disappeared from the bar with
+  no line in the journal. A pick can also no longer persist an address the list never
+  offered.
+
 ## 0.6.0
 
 - **The chat window resizes by its edges.** Grab the right edge, the bottom edge or the
