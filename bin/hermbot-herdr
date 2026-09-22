@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+# hermbot-herdr - land one Hermes conversation in Herdr.
+#
+#   hermbot-herdr --bot dev --session <id> [--title <title>] [--json] [--print]
+#
+# One intention: "show me this conversation in Herdr". Herdr keeps every Hermes
+# conversation in its own pane, so the conversation IS the destination:
+#
+#   focused - a pane already runs this conversation, so raise its tab and window;
+#   opened  - nothing runs it, so make a tab, start hermes on that exact session,
+#             raise it.
+#
+# The conversation is addressed by ID, never by title. The roster elides titles
+# with an ellipsis ("Jaką komendą... otworzyć wątek HermBot…"), so a title is a
+# name that would continue a session that does not exist; the id is exact.
+#
+# Herdr is a local thing: a session id from a remote instance names a session on
+# that host, which no pane here can run. The widget only offers this for the
+# local instance, and this script refuses anything it cannot place rather than
+# opening a pane that talks to nothing.
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+sys.path.insert(0, str(_HERE))
+import hermbot_paths  # noqa: E402  (a sibling script directory, resolved above)
+
+LOG = hermbot_paths.STATE_DIR / "herdr.log"
+
+
+def log(line):
+    hermbot_paths.append_log(LOG, line)
+
+
+def run(cmd, timeout=15):
+    """Run one command, capture it, never raise. Returns (rc, stdout, stderr)."""
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        return out.returncode, out.stdout, out.stderr
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, "", str(exc)
+
+
+def herdr_json(herdr, args, timeout=15):
+    """One socket-API call, unwrapped to its `result`. Raises RuntimeError."""
+    rc, out, err = run([herdr] + args, timeout=timeout)
+    text = (out or "").strip()
+    if rc != 0 or not text:
+        raise RuntimeError((err or out or f"herdr {' '.join(args)} failed").strip()[:200])
+    try:
+        payload = json.loads(text.splitlines()[-1])
+    except (ValueError, IndexError):
+        raise RuntimeError(f"herdr {' '.join(args)}: not JSON")
+    if isinstance(payload, dict) and "error" in payload and payload.get("result") is None:
+        raise RuntimeError(str(payload["error"])[:200])
+    return payload.get("result", payload)
+
+
+def match_agent(agents, session):
+    """The pane already running this conversation, or None.
+
+    ONLY the session id counts. A pane we opened carries the id in its terminal
+    title (`hermes -p <profile> chat -c <id>`), so the match is exact and cannot
+    land on another conversation. The profile alone is NOT enough: several idle
+    panes can all be `-p dev`, and switching to one of them is exactly the "it
+    opened the wrong thread" failure - so a session that is not running is
+    reported as not running, and the caller opens it. The title is deliberately
+    not matched either: the roster elides titles, and a title that is a prefix of
+    another conversation's title would focus the wrong pane.
+    """
+    if not session:
+        return None
+    for agent in agents:
+        if session in str(agent.get("terminal_title") or ""):
+            return agent
+    return None
+
+
+def pick_workspace(workspaces):
+    """Where a new tab goes: the `hermes` workspace when there is one.
+
+    That is where conversations already live on this desktop; falling back to the
+    focused workspace keeps a fresh install from inventing a workspace of its own.
+    """
+    if not workspaces:
+        return None
+    for w in workspaces:
+        if str(w.get("label") or "").strip().lower() == "hermes":
+            return str(w.get("workspace_id") or "")
+    for w in workspaces:
+        if w.get("focused"):
+            return str(w.get("workspace_id") or "")
+    return str(workspaces[0].get("workspace_id") or "")
+
+
+def _clients():
+    hyprctl = shutil.which("hyprctl")
+    if not hyprctl:
+        return []
+    rc, out, _ = run([hyprctl, "-j", "clients"], timeout=5)
+    if rc != 0:
+        return []
+    try:
+        return json.loads(out or "[]")
+    except ValueError:
+        return []
+
+
+def herdr_window():
+    """The terminal window a Herdr client is attached in, if one is open.
+
+    Herdr titles its terminal "{hostname}: {workspace}", and a client launched by
+    Omarchy carries an app-id naming it, so either is enough to recognise it. No
+    client is attached whenever the server runs headless, which is a real state -
+    then the window has to be launched, not focused.
+    """
+    host = os.uname().nodename
+    by_host = None
+    for client in _clients():
+        cls = str(client.get("class") or "").lower()
+        title = str(client.get("title") or "")
+        if "herdr" in cls or "herdr" in title.lower():
+            return client
+        if by_host is None and title.startswith(host + ": "):
+            by_host = client
+    return by_host
+
+
+def focus_window(client):
+    """Raise one window by address.
+
+    This Hyprland is Lua-configured (Omarchy Quattro), so the classic
+    `dispatch focuswindow class:...` string is rewritten into invalid Lua; the
+    dispatcher has to be called as Lua, and the raw address is the fallback for
+    builds that still take it.
+    """
+    if not client:
+        return False
+    hyprctl = shutil.which("hyprctl")
+    if not hyprctl:
+        return False
+    addr = "address:" + str(client.get("address") or "")
+    rc, out, _ = run([hyprctl, "dispatch", 'hl.dsp.focus({ window = "%s" })' % addr], timeout=5)
+    if str(out).strip().startswith("ok"):
+        return True
+    run([hyprctl, "dispatch", "focuswindow", addr], timeout=5)
+    return False
+
+
+def ensure_window():
+    """Put a Herdr client on screen: raise the one that exists, else start one.
+
+    `omarchy-launch-or-focus-tui` is the desktop's own launch-or-raise helper, so
+    a client that is already up is focused rather than a second one spawned.
+    """
+    client = herdr_window()
+    if client:
+        focus_window(client)
+        return "focused"
+    launcher = shutil.which("omarchy-launch-or-focus-tui") or shutil.which("omarchy-launch-terminal-herdr")
+    if not launcher:
+        return "none"
+    try:
+        subprocess.Popen([launcher, "herdr"] if launcher.endswith("launch-or-focus-tui") else [launcher],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return "none"
+    return "launched"
+
+
+def _pane_for_tab(herdr, tab_id):
+    """The pane a single-pane tab owns, or "" when there is none to reuse."""
+    for p in (herdr_json(herdr, ["pane", "list"]).get("panes") or []):
+        if str(p.get("tab_id")) == str(tab_id):
+            return str(p.get("pane_id") or "")
+    return ""
+
+
+def start_agent(herdr, label, pane, profile, session):
+    """Start hermes on one exact session in an existing pane.
+
+    `agent start` waits for the agent to be ready and is the supported door;
+    `pane run` is the plain one, kept for a Herdr that does not know the kind.
+    """
+    args = ["-p", profile, "chat", "-c", session]
+    rc, _, _ = run([herdr, "agent", "start", label, "--kind", "hermes", "--pane", pane,
+                    "--"] + args, timeout=45)
+    if rc != 0:
+        run([herdr, "pane", "run", pane, "hermes"] + args, timeout=20)
+
+
+def open_session(herdr, profile, session, title, agents):
+    """Land a conversation that is not running, in a tab of its own.
+
+    A tab we already made for this conversation - its label names the profile and
+    the conversation - is reused when its pane sits at a shell prompt, so opening
+    the same conversation twice does not grow a second identical tab. A tab whose
+    pane is busy with another agent is left alone.
+    """
+    label = "%s-%s" % (profile, (title.strip() or session))
+    busy = {str(a.get("pane_id") or "") for a in agents}
+    for t in (herdr_json(herdr, ["tab", "list"]).get("tabs") or []):
+        if str(t.get("label") or "") != label:
+            continue
+        pane = _pane_for_tab(herdr, t.get("tab_id"))
+        if pane and pane not in busy:
+            start_agent(herdr, label, pane, profile, session)
+            run([herdr, "tab", "focus", str(t.get("tab_id") or "")], timeout=10)
+            return pane, str(t.get("tab_id") or "")
+
+    workspaces = herdr_json(herdr, ["workspace", "list"]).get("workspaces") or []
+    ws = pick_workspace(workspaces)
+    args = ["tab", "create", "--label", label, "--focus"]
+    if ws:
+        args += ["--workspace", ws]
+    created = herdr_json(herdr, args, timeout=20)
+    pane = str(((created.get("root_pane") or {}).get("pane_id")) or "")
+    tab_id = str(((created.get("tab") or {}).get("tab_id")) or "")
+    if not pane:
+        raise RuntimeError("herdr tab create returned no pane")
+    start_agent(herdr, label, pane, profile, session)
+    return pane, tab_id
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Show one Hermes conversation in Herdr.")
+    ap.add_argument("--bot", required=True, help="bot name (Hermes profile)")
+    ap.add_argument("--session", required=True, help="the session id to land in")
+    ap.add_argument("--title", default="", help="the session title, used to name the tab")
+    ap.add_argument("--json", action="store_true", help="machine-readable result")
+    ap.add_argument("--print", dest="dry_run", action="store_true", help="resolve and report, change nothing")
+    args = ap.parse_args(argv)
+
+    profile = str(args.bot).lstrip("@").strip()
+    session = str(args.session).strip()
+    title = str(args.title or "").strip()
+    if not profile or not session:
+        return _fail(args, "a bot and a session id are required")
+
+    herdr = shutil.which("herdr")
+    if not herdr:
+        return _fail(args, "herdr is not installed")
+
+    try:
+        agents = herdr_json(herdr, ["agent", "list"]).get("agents") or []
+    except RuntimeError as exc:
+        return _fail(args, str(exc))
+
+    found = match_agent(agents, session)
+    result = {"bot": profile, "session": session, "title": title,
+              "pane_id": "", "tab_id": "", "window": ""}
+
+    if found:
+        result["action"] = "focused"
+        result["pane_id"] = str(found.get("pane_id") or "")
+        result["tab_id"] = str(found.get("tab_id") or "")
+        if args.dry_run:
+            result["window"] = "dry-run"
+        else:
+            run([herdr, "agent", "focus", result["pane_id"] or session], timeout=10)
+            result["window"] = ensure_window()
+    else:
+        result["action"] = "opened"
+        if args.dry_run:
+            workspaces = herdr_json(herdr, ["workspace", "list"]).get("workspaces") or []
+            result["workspace"] = pick_workspace(workspaces) or ""
+            result["window"] = "dry-run"
+        else:
+            try:
+                pane, tab_id = open_session(herdr, profile, session, title, agents)
+            except RuntimeError as exc:
+                return _fail(args, str(exc))
+            result["pane_id"] = pane
+            result["tab_id"] = tab_id
+            result["window"] = ensure_window()
+
+    log("%s/%s: %s %s %s" % (profile, session, result["action"],
+                             result.get("pane_id") or "", result.get("window") or ""))
+    if args.json or args.dry_run:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        print("%s: %s %s" % (profile, result["action"], result.get("pane_id") or ""))
+    return 0
+
+
+def _fail(args, message):
+    if args.json or args.dry_run:
+        print(json.dumps({"error": message}, ensure_ascii=False))
+    else:
+        print("hermbot-herdr: " + message, file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

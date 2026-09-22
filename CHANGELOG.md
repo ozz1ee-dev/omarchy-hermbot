@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.8.0
+
+- **Take a conversation to Herdr.** The row under the cursor offers `↗ herdr` - the
+  open chat has one in its header, and `⇧H` does the same from the roster - and it
+  shows you that conversation in [Herdr](https://herdr.dev): raising the pane when
+  it is already running, and otherwise making a tab, starting `hermes` on that exact
+  session, and bringing the Herdr window forward. The conversation is addressed by
+  session id, never by title, because the roster elides titles with an ellipsis. It
+  is offered only while the roster is read from this machine: a remote session id
+  names a session no pane here can run. A jump closes the panel - the conversation
+  has moved to the terminal, and Hermes allows one writer per session.
+
+### Fixed
+
+- **The jump lands on the exact conversation, or opens it.** A pane is matched by
+  the session id alone. The profile is never a fallback: several idle panes can
+  share one, and switching to any of them opened a different thread - which is
+  exactly what "it does not go to the right conversation" was. When no pane runs
+  the session it is opened, and a tab this widget already made for it (its label
+  names the profile and the conversation) is reused rather than duplicated.
+- **A bare `h` no longer blurs the panel.** The framework's key catcher claims `h`
+  as "move left" before any text key is handed to the widget, and the widget had
+  wired "move left" to the privacy scrub - so `h` turned every label into noise.
+  The scrub is an IPC-only aid now (`omarchy-shell ozz1ee.hermbot scrub`), and the
+  Herdr jump sits on `⇧H`, which the catcher leaves alone.
+
 ## 0.7.0
 
 - **Pick the instance from the panel.** `s` opens a list of every instance this install

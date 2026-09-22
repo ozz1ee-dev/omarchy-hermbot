@@ -65,6 +65,24 @@ Panel {
   readonly property string watcher: Qt.resolvedUrl("bin/hermbot-watch").toString().replace(/^file:\/\//, "")
   readonly property string opener: Qt.resolvedUrl("bin/hermbot-open").toString().replace(/^file:\/\//, "")
   readonly property string sender: Qt.resolvedUrl("bin/hermbot-send").toString().replace(/^file:\/\//, "")
+  readonly property string herdr: Qt.resolvedUrl("bin/hermbot-herdr").toString().replace(/^file:\/\//, "")
+
+  // Herdr: the terminal workspace manager, where every Hermes conversation lives
+  // in its own pane. One intention - "show me this conversation in Herdr" - from a
+  // row, from the chat header, and from Shift+H on the roster. The conversation is
+  // addressed by session ID, never by title: the roster elides titles with an
+  // ellipsis, and a title would continue a session that does not exist.
+  //
+  // Offered only for the LOCAL instance. A session id from a remote host names a
+  // session on that machine, which no pane here can run - an action there would be
+  // a promise the click cannot keep.
+  readonly property bool herdrHere: activeInstance === "local"
+  // What the last jump said, when it could not land: shown in the footer so a
+  // failed jump is a sentence, not a closed panel with no window behind it.
+  property string herdrFlash: ""
+  // One jump at a time: the script is a round trip, and a second press while the
+  // first is in flight would race it.
+  property bool herdrJumping: false
 
   // Notifications when a bot writes or starts waiting for you. These belong to the
   // watcher: it is the only thing that sees a transition, and it owns the state
@@ -1233,6 +1251,74 @@ Panel {
     root.close()
   }
 
+  // ------------------------------------------------------------------ herdr
+  // The conversation a row is about, as (profile, session id, title). A bot row
+  // means its own canonical Bot Chat - the same conversation Enter opens here - and
+  // a session row means that exact session. One resolver shared by the row action,
+  // the chat header and the Shift+H key, so all three land on the same thread.
+  function herdrTargetFor(row) {
+    if (!row || !row.bot) return null
+    var bot = row.bot
+    var session = row.kind === "bot" ? (bot.chat || bot.attach) : row.session
+    if (!session) return null
+    var sid = String(session.session_id || "")
+    if (sid === "") return null
+    return { bot: String(bot.name), session: sid,
+             title: String(session.title || bot.title || "") }
+  }
+
+  function herdrOpen(bot, session, title) {
+    if (!root.herdrHere || root.herdrJumping) return
+    var sid = String(session || "")
+    if (sid === "") { root.herdrFlash = "nothing to open in herdr"; return }
+    root.herdrFlash = ""
+    root.herdrJumping = true
+    herdrProc.command = [root.herdr, "--bot", String(bot), "--session", sid,
+                         "--title", String(title || ""), "--json"]
+    herdrProc.running = true
+  }
+
+  function openInHerdr(row) {
+    var t = root.herdrTargetFor(row)
+    if (!t) { root.herdrFlash = "nothing to open in herdr"; return }
+    root.herdrOpen(t.bot, t.session, t.title)
+  }
+
+  function openChatInHerdr() {
+    if (!root.chat) return
+    root.herdrOpen(root.chat.bot, root.chat.session_id, root.chat.title)
+  }
+
+  // The jump is a round trip, so the outcome decides the panel: a landing closes it
+  // (the conversation moves to Herdr, and Hermes allows one writer per session), a
+  // failure keeps it open with the reason in the footer. Closing on the way out -
+  // before the script answered - is how a failed jump used to leave a closed panel
+  // and no window anywhere.
+  Process {
+    id: herdrProc
+    running: false
+    stdout: SplitParser {
+      onRead: function(line) {
+        var d
+        try { d = JSON.parse(String(line)) } catch (e) { return }
+        root.herdrJumping = false
+        if (!d) return
+        if (d.error) { root.herdrFlash = "herdr: " + String(d.error); return }
+        if (d.action === "focused" || d.action === "opened") root.close()
+      }
+    }
+    stderr: SplitParser {
+      onRead: function(data) {
+        var s = String(data).trim()
+        if (s !== "") console.warn("hermbot herdr", s)
+      }
+    }
+    onExited: function(code) {
+      root.herdrJumping = false
+      if (code !== 0 && root.herdrFlash === "") root.herdrFlash = "herdr: the jump exited " + code
+    }
+  }
+
   // ------------------------------------------------------------------ the chat
   // Open a conversation in the panel. The thread is read from the bot's own store,
   // and whatever is typed is delivered into THAT session - not into the canonical
@@ -1831,7 +1917,17 @@ Panel {
     }
     function state(): string {
       return JSON.stringify({ counts: root.counts, gateway: root.gateway, bots: root.bots.length,
-        barEdge: root.barEdge, barAvatars: barAvatarModel.count })
+        barEdge: root.barEdge, barAvatars: barAvatarModel.count,
+        herdrHere: root.herdrHere, herdrJumping: root.herdrJumping, herdrFlash: root.herdrFlash })
+    }
+    // Drive one Herdr jump without a click or a key, so a probe can reach the same
+    // code the row button, the chat button and Shift+H do. The script is a round
+    // trip, so the outcome lands in `state` (herdrFlash / herdrJumping and whether
+    // the panel closed) rather than in this return value.
+    function herdr(bot: string, session: string): string {
+      root.herdrOpen(String(bot), String(session), "")
+      return JSON.stringify({ here: root.herdrHere, jumping: root.herdrJumping,
+                              flash: root.herdrFlash })
     }
     // The instance picker, drivable from outside. It is the one control that changes
     // which machine answers, and a probe has no keyboard: without these the feature
@@ -2180,7 +2276,11 @@ Panel {
       blocked: root.chat !== null && chatInput.activeFocus
 
       onMoveRequested: function(dx, dy) {
-        if (dx < 0) root.scrub = !root.scrub
+        // Horizontal movement is a dead end here: the list is one column. The
+        // catcher sends `dx < 0` for BOTH the Left arrow and a bare `h`, so the
+        // privacy scrub used to live on that key - which meant a bare `h` blurred
+        // the whole panel instead of doing anything. Scrub is an IPC-only aid now
+        // (`omarchy-shell ozz1ee.hermbot scrub`); `h` is left to the framework.
         if (dy !== 0) { if (root.instOpen) root.moveInstCursor(dy); else root.moveCursor(dy) }
       }
       onActivateRequested: {
@@ -2209,6 +2309,11 @@ Panel {
         else if (t === "o" || t === "O") root.openRowInDesktop(root.cursor)
         else if (t === "w" || t === "W") root.toggleWork()
         else if (t === "n" || t === "N") root.startNewChatForCursor()
+        // Shift+H, not a bare `h`: the catcher claims `h` as "move left" before any
+        // text key is handed over, so a bare `h` can never reach here. Uppercase H
+        // falls through, and it means the same thing on every row - take the
+        // conversation under the cursor to Herdr.
+        else if (t === "H") root.openInHerdr(root.rows[root.cursor])
         // Text size is Ctrl+= / Ctrl+- / Ctrl+0 in BOTH modes, handled by the widget's
         // own key handler - the catcher only ever hands over the character itself, so a
         // bare "+" here could not tell a text-size request from anything else, and next
@@ -2404,12 +2509,35 @@ Panel {
                     onClicked: root.startNewChat(root.botByName(root.chat ? root.chat.bot : ""))
                   }
                 }
+                // The way out of the panel and into Herdr, where the same conversation
+                // lives as a terminal pane. It sits with the other chat actions because
+                // you decide to take a conversation to the terminal while reading it.
+                Text {
+                  id: herdrBtn
+                  visible: root.herdrHere
+                  anchors.left: newText.right
+                  anchors.leftMargin: Style.space(16)
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: root.herdrJumping ? "↗ herdr…" : "↗ herdr"
+                  color: herdrArea.containsMouse ? root.fg : root.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(Style.font.caption)
+                  MouseArea {
+                    id: herdrArea
+                    anchors.fill: parent
+                    anchors.margins: -Style.space(4)
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.openChatInHerdr()
+                  }
+                }
                 // A chat that does not exist yet says so AND says who it is with: `n`
                 // acts on the row under the cursor, and a conversation with an
                 // unnamed bot is not something to type into.
                 Text {
                   id: newNoteText
-                  anchors.left: newText.right
+                  anchors.left: herdrBtn.visible ? herdrBtn.right : newText.right
                   anchors.leftMargin: Style.space(16)
                   anchors.verticalCenter: parent.verticalCenter
                   textFormat: Text.PlainText
@@ -2424,7 +2552,8 @@ Panel {
                 // send that goes nowhere. It sits in the LEFT chain with the other
                 // state markers - right-aligned it landed on top of the title.
                 Text {
-                  anchors.left: newNoteText.visible ? newNoteText.right : newText.right
+                  anchors.left: newNoteText.visible ? newNoteText.right
+                                 : (herdrBtn.visible ? herdrBtn.right : newText.right)
                   anchors.leftMargin: Style.space(16)
                   anchors.verticalCenter: parent.verticalCenter
                   textFormat: Text.PlainText
@@ -3289,6 +3418,7 @@ Panel {
                 maximumLineCount: 1
               }
               Text {
+                id: sessionTime
                 textFormat: Text.PlainText
                 visible: modelData.kind === "attach" || modelData.kind === "pinned"
                 anchors.right: parent.right
@@ -3298,6 +3428,28 @@ Panel {
                 color: root.faint
                 font.family: root.fontFamily
                 font.pixelSize: root.fs(Style.font.caption)
+              }
+              // The Herdr action, named on the row under the cursor: the list stays a
+              // list until you point at one, and then the one thing that row can do
+              // beyond opening here is spelled out. Clicking it hands the conversation
+              // to Herdr; the body of the row still opens the chat in the panel.
+              Text {
+                textFormat: Text.PlainText
+                visible: root.herdrHere && index === root.cursor
+                         && (modelData.kind === "attach" || modelData.kind === "pinned")
+                anchors.right: sessionTime.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                text: "↗ herdr"
+                color: root.accent
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(Style.font.caption)
+                MouseArea {
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(4)
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.openInHerdr(modelData)
+                }
               }
 
               // The pinned section, and the bot each group of pinned chats belongs
@@ -3338,6 +3490,30 @@ Panel {
                 anchors.rightMargin: -Style.space(4)
                 radius: Style.space(1.5)
                 color: index === root.cursor ? root.hilite : "transparent"
+
+                // The row's own click target, declared BEFORE the content so the
+                // content sits on top of it: the avatar, the name and the preview
+                // pass clicks straight through, and the one interactive thing in
+                // there - the Herdr action - gets the click it was aimed at.
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onEntered: {
+                    root.cursor = index
+                    var e = mapToItem(keyCatcher, mouseX, mouseY)
+                    keyCatcher.pointerAt(e.x, e.y)
+                  }
+                  onExited: keyCatcher.pointerGone()
+                  onClicked: root.clickRow(index)
+                  // Hover goes to the topmost item, so a row would otherwise
+                  // starve the panel-wide tracker and the eyes would freeze
+                  // exactly when you are looking at them.
+                  onPositionChanged: function(mouse) {
+                    var p = mapToItem(keyCatcher, mouse.x, mouse.y)
+                    keyCatcher.pointerAt(p.x, p.y)
+                  }
+                }
 
                 Row {
                   anchors.verticalCenter: parent.verticalCenter
@@ -3439,6 +3615,27 @@ Panel {
                     width: implicitWidth
                     spacing: Style.space(6)
 
+                    // The Herdr action, named on the row under the cursor. It rides
+                    // the right cluster so it never covers the name or the preview,
+                    // and appears where the eye already is. Clicking it hands this
+                    // conversation to Herdr; clicking anywhere else on the row still
+                    // opens the chat in the panel.
+                    Text {
+                      textFormat: Text.PlainText
+                      visible: root.herdrHere && index === root.cursor
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: "↗ herdr"
+                      color: root.accent
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fs(Style.font.caption)
+                      MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -Style.space(4)
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.openInHerdr(modelData)
+                      }
+                    }
+
                     // The count where the conversation is, a plain dot everywhere else:
                     // the number rides the row whose chat it counts, and the dot marks
                     // the other session rows the desktop paints green. `chat.unread`
@@ -3488,26 +3685,6 @@ Panel {
                     }
                   }
                 }
-
-                MouseArea {
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onEntered: {
-                    root.cursor = index
-                    var e = mapToItem(keyCatcher, mouseX, mouseY)
-                    keyCatcher.pointerAt(e.x, e.y)
-                  }
-                  onExited: keyCatcher.pointerGone()
-                  onClicked: root.clickRow(index)
-                  // Hover goes to the topmost item, so a row would otherwise
-                  // starve the panel-wide tracker and the eyes would freeze
-                  // exactly when you are looking at them.
-                  onPositionChanged: function(mouse) {
-                    var p = mapToItem(keyCatcher, mouse.x, mouse.y)
-                    keyCatcher.pointerAt(p.x, p.y)
-                  }
-                }
               }
             }
           }
@@ -3550,6 +3727,7 @@ Panel {
         // may carry markup. The transcript never does.
         readonly property string actLine: "<b>j/k</b> move · <b>⏎</b> open · <b>o</b> desktop · <b>n</b> new "
                                           + (root.newBot !== "" ? root.newBot : "chat")
+                                          + (root.herdrHere ? " · <b>⇧H</b> herdr" : "")
         readonly property string showLine: "<b>g</b> " + root.ordering + " · <b>p</b> pinned · <b>s</b> "
                                            + root.source + " · <b>r</b> " + root.barMetric
                                            + " · <b>ctrl +/-</b> text " + Math.round(root.fontScale * 100) + "%"
