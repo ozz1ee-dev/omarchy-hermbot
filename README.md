@@ -89,8 +89,8 @@ instead of failing silently.
 ## Herdr
 
 [Herdr](https://herdr.dev) keeps every Hermes conversation in its own terminal
-pane. The row under the cursor names a `↗ herdr` action - the open chat has one in
-its header, and `⇧H` does the same from the roster - and it shows you that
+pane. The row under the cursor names a `herdr` action - the open chat has one in
+its header, and `Shift+H` does the same from the roster - and it shows you that
 conversation in Herdr: raising its pane when it is already running, and otherwise
 making (or reusing) a tab and starting `hermes` on that exact session. The
 conversation is addressed by session id, never by title, because the roster elides
@@ -112,7 +112,7 @@ With the panel open (click the mark, or `omarchy-shell ozz1ee.hermbot toggle`):
 | `Enter` | open the row under the cursor |
 | `n` | start a new chat with the bot under the cursor, in the panel's chat window |
 | `o` | open the row in Hermes Desktop |
-| `⇧H` | take the row under the cursor to Herdr (see below) |
+| `Shift+H` | take the row under the cursor to Herdr (see below) |
 | `g` | cycle the panel order (`attention` -> `gateway` -> `flat`), saved |
 | `p` | show or hide the PINNED section, saved |
 | `s` | follow the app (`auto`) or this machine (`local`), saved |
@@ -146,7 +146,7 @@ tested and how the screenshots above were taken:
 | `omarchy-shell ozz1ee.hermbot chatState` | what the chat window is showing, and whether the panel is up, as one JSON line |
 | `omarchy-shell ozz1ee.hermbot newChat` / `closeChat` | the same calls `n` and `Esc` make, so the key and the function can be told apart |
 | `omarchy-shell ozz1ee.hermbot openThread <session-id>` | open one exact session in the chat window |
-| `omarchy-shell ozz1ee.hermbot herdr <bot> <session-id>` | the same jump the `↗ herdr` action makes, without a click |
+| `omarchy-shell ozz1ee.hermbot herdr <bot> <session-id>` | the same jump the `herdr` action makes, without a click |
 | `omarchy-shell ozz1ee.hermbot picker [dir]` / `attach <path>` | stage the file browser and an attachment, which a probe otherwise cannot click |
 
 ## Settings

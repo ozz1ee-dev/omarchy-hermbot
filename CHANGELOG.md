@@ -2,8 +2,8 @@
 
 ## 0.8.0
 
-- **Take a conversation to Herdr.** The row under the cursor offers `↗ herdr` - the
-  open chat has one in its header, and `⇧H` does the same from the roster - and it
+- **Take a conversation to Herdr.** The row under the cursor offers `herdr` - the
+  open chat has one in its header, and `Shift+H` does the same from the roster - and it
   shows you that conversation in [Herdr](https://herdr.dev): raising the pane when
   it is already running, and otherwise making a tab, starting `hermes` on that exact
   session, and bringing the Herdr window forward. The conversation is addressed by
@@ -24,7 +24,7 @@
   as "move left" before any text key is handed to the widget, and the widget had
   wired "move left" to the privacy scrub - so `h` turned every label into noise.
   The scrub is an IPC-only aid now (`omarchy-shell ozz1ee.hermbot scrub`), and the
-  Herdr jump sits on `⇧H`, which the catcher leaves alone.
+  Herdr jump sits on `Shift+H`, which the catcher leaves alone.
 
 ## 0.7.0
 
