@@ -9,7 +9,7 @@ of this repository, select **Report a vulnerability**, and describe the issue.
 This keeps the report private until a fix is available.
 
 If private reporting is unavailable, open a minimal public issue asking for a
-private channel — without including any vulnerability details.
+private channel without including any vulnerability details.
 
 ## Supported versions
 
