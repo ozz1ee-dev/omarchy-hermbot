@@ -17,14 +17,14 @@ jobs:
       # in this repository's CI. The version comment is for humans, and the SHA
       # is resolved from this repository's own dependency, not copied from a
       # sibling repo: gh api repos/actions/checkout/git/ref/tags/v5 -q .object.sha
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: manifest contract
         run: python3 scripts/check-manifest.py .
 
   qml:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install qmllint
         run: |
           sudo apt-get update
@@ -59,7 +59,7 @@ jobs:
   portability:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: the plugin adapts to a machine that is not ours
         # Runs the watcher inside a throwaway "foreign" world (its own HERMES_HOME
         # and XDG_* directories) on a runner that has neither Omarchy nor Hermes
@@ -70,7 +70,7 @@ jobs:
   ascii:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: text files are ASCII
         # QML is deliberately not in this list: a widget draws real glyphs as
         # part of its design, and those belong in the file, not in a check that
