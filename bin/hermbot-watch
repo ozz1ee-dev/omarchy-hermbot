@@ -32,6 +32,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -1261,7 +1262,14 @@ def ssh_argv(target, remote_args):
         argv += ["-p", str(target["port"])]
     if target.get("key_path"):
         argv += ["-i", str(target["key_path"])]
-    argv += [f"{target.get('user') or 'root'}@{target['host']}", "python3 -", *remote_args]
+    # Everything after the host is ONE remote command, not a list: ssh joins these
+    # arguments with spaces and hands the string to the remote shell, so an argument's
+    # boundaries do not survive on their own. A directory named `notes;id;#` in a remote
+    # listing used to become a second command executed as the ssh account. shlex.join
+    # quotes every argument for that shell, and keeps empty ones as '' - a bare `--ls`
+    # must not silently lose its empty directory.
+    remote_command = shlex.join(["python3", "-", *remote_args])
+    argv += [f"{target.get('user') or 'root'}@{target['host']}", remote_command]
     return argv
 
 

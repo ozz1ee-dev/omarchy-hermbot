@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.1
+
+### Fixed
+
+- **The remote command is quoted for the far side.** Everything the watcher passes to
+  `ssh` after the host is joined into a single command string and handed to the remote
+  shell, which splits it again on spaces and on separators - so an argument's own
+  boundaries did not survive, and a directory named `notes;id;#` in a remote listing
+  would have run `id` as the ssh account. The remote command is now built with
+  `shlex.join`, which quotes every argument; it also keeps empty arguments visible, so
+  a bare `--ls` no longer loses its empty directory. Found in review of the marketplace
+  submission.
+
 ## 0.8.0
 
 - **Take a conversation to Herdr.** The row under the cursor offers `herdr` - the
